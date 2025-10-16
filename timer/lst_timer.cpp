@@ -192,7 +192,8 @@ void Utils::sig_handler(int sig)
 static Utils *g_utils_instance = NULL;
 
 // 全局信号处理函数，桥接到Utils实例
-static void global_sig_handler(int sig)
+// 改为非静态，以便在其他文件中使用
+void global_sig_handler(int sig)
 {
     if (g_utils_instance)
     {

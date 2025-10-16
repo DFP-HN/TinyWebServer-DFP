@@ -140,19 +140,38 @@ server.eventLoop();
 
 ## Build Commands
 
-### Build the server
+### Quick Start with Docker (推荐)
+
+使用 Docker Compose 一键启动（包含 MySQL）：
+
+```bash
+# 启动所有服务
+docker-compose up -d
+
+# 查看运行状态
+docker-compose ps
+
+# 访问服务
+# http://localhost:9006
+```
+
+详见 `DOCKER.md` 获取完整 Docker 部署指南。
+
+### 本地编译运行
+
+#### Build the server
 ```bash
 sh ./build.sh
 # Or directly:
 make server
 ```
 
-### Clean build artifacts
+#### Clean build artifacts
 ```bash
 make clean
 ```
 
-### Run the server
+#### Run the server
 ```bash
 ./server
 ```
@@ -355,8 +374,48 @@ cd test_pressure/webbench-1.5
 
 Close logging (`-c 1`) for more accurate performance measurement.
 
+## Docker Deployment
+
+### Prerequisites
+- Docker Engine 20.10+
+- Docker Compose 1.29+
+
+### Quick Start
+```bash
+# 启动服务（包含 MySQL）
+docker-compose up -d
+
+# 查看日志
+docker-compose logs -f webserver
+
+# 停止服务
+docker-compose down
+```
+
+### Docker Files
+- **`Dockerfile`**: 应用容器定义
+- **`docker-compose.yml`**: 多容器编排配置
+- **`docker-entrypoint.sh`**: 容器启动脚本
+- **`docker/init-db/init.sql`**: 数据库初始化脚本
+- **`DOCKER.md`**: 完整 Docker 部署文档
+
+### Benefits
+- ✅ 无需手动安装依赖
+- ✅ 一键启动完整环境（包括 MySQL）
+- ✅ 自动初始化数据库
+- ✅ 跨平台支持（Linux/Mac/Windows）
+- ✅ 环境隔离，避免冲突
+
+详见 `DOCKER.md` 获取详细说明和故障排查。
+
 ## Common Issues
 
+### Docker Environment
+- **端口占用**: 修改 `docker-compose.yml` 中的端口映射
+- **MySQL 连接失败**: 检查 `docker-compose logs mysql`
+- **容器无法启动**: 查看 `docker-compose logs webserver`
+
+### Native Environment
 - **Webbench not found**: Delete the `webbench` executable and recompile
 - **MySQL connection failures**: Verify database credentials in `main.cpp` and ensure MySQL is running
 - **Port already in use**: Change port with `-p` flag

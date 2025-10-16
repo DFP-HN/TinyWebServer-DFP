@@ -67,3 +67,9 @@ bool UserManager::add_user(const string &username, const string &password)
     m_lock.unlock();
     return false;
 }
+
+// 不加锁的版本，供已持有锁的调用者使用
+void UserManager::add_user_unlocked(const string &username, const string &password)
+{
+    m_users[username] = password;
+}

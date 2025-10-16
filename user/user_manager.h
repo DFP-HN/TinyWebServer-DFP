@@ -30,6 +30,9 @@ public:
     bool has_user(const string &username) const;
     bool add_user(const string &username, const string &password);
 
+    // 内部使用：不加锁的添加用户（调用者需要持有锁）
+    void add_user_unlocked(const string &username, const string &password);
+
     // 获取锁（用于数据库操作）
     locker &get_lock() { return m_lock; }
 

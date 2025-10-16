@@ -114,4 +114,7 @@ void cb_func(client_data *user_data, EpollManager *epoll_mgr, UserManager *user_
 // 设置全局Utils实例（用于信号处理）
 void set_global_utils_instance(Utils *utils);
 
+// 全局信号处理函数（用于信号注册）
+void global_sig_handler(int sig);
+
 #endif

@@ -3,6 +3,10 @@
 #include <mysql/mysql.h>
 #include <fstream>
 
+// 引入新的管理器类
+#include "../epoll/epoll_manager.h"
+#include "../user/user_manager.h"
+
 //定义http响应的一些状态信息
 const char *ok_200_title = "OK";
 const char *error_400_title = "Bad Request";
@@ -14,23 +18,52 @@ const char *error_404_form = "The requested file was not found on this server.\n
 const char *error_500_title = "Internal Error";
 const char *error_500_form = "There was an unusual problem serving the request file.\n";
 
-locker m_lock;
-map<string, string> users;
+// 【已移除】全局变量 m_lock 和 users
+// 这些现在由 UserManager 管理
+
+// 构造函数
+http_conn::http_conn()
+    : m_epoll_manager(nullptr), m_user_manager(nullptr)
+{
+}
+
+// 析构函数
+http_conn::~http_conn()
+{
+}
+
+// 依赖注入：设置 EpollManager
+void http_conn::set_epoll_manager(EpollManager *epoll_mgr)
+{
+    m_epoll_manager = epoll_mgr;
+}
+
+// 依赖注入：设置 UserManager
+void http_conn::set_user_manager(UserManager *user_mgr)
+{
+    m_user_manager = user_mgr;
+}
 
 void http_conn::initmysql_result(connection_pool *connPool)
 {
     //先从连接池中取一个连接
-    MYSQL *mysql = NULL;
-    connectionRAII mysqlcon(&mysql, connPool);
+    MYSQL *mysql_conn = NULL;
+    connectionRAII mysqlcon(&mysql_conn, connPool);
 
-    //在user表中检索username，passwd数据，浏览器端输入
-    if (mysql_query(mysql, "SELECT username,passwd FROM user"))
+    //在user表中检索username,passwd数据,浏览器端输入
+    if (mysql_query(mysql_conn, "SELECT username,passwd FROM user"))
     {
-        LOG_ERROR("SELECT error:%s\n", mysql_error(mysql));
+        LOG_ERROR("SELECT error:%s\n", mysql_error(mysql_conn));
+        return;
     }
 
     //从表中检索完整的结果集
-    MYSQL_RES *result = mysql_store_result(mysql);
+    MYSQL_RES *result = mysql_store_result(mysql_conn);
+    if (!result)
+    {
+        LOG_ERROR("mysql_store_result error:%s\n", mysql_error(mysql_conn));
+        return;
+    }
 
     //返回结果集中的列数
     int num_fields = mysql_num_fields(result);
@@ -38,64 +71,30 @@ void http_conn::initmysql_result(connection_pool *connPool)
     //返回所有字段结构的数组
     MYSQL_FIELD *fields = mysql_fetch_fields(result);
 
-    //从结果集中获取下一行，将对应的用户名和密码，存入map中
+    // 构建用户数据map
+    map<string, string> users_data;
     while (MYSQL_ROW row = mysql_fetch_row(result))
     {
         string temp1(row[0]);
         string temp2(row[1]);
-        users[temp1] = temp2;
+        users_data[temp1] = temp2;
     }
+
+    // 将用户数据存储到 UserManager（所有http_conn共享）
+    if (m_user_manager)
+    {
+        m_user_manager->set_users(users_data);
+    }
+
+    mysql_free_result(result);
 }
 
-//对文件描述符设置非阻塞
-int setnonblocking(int fd)
-{
-    int old_option = fcntl(fd, F_GETFL);
-    int new_option = old_option | O_NONBLOCK;
-    fcntl(fd, F_SETFL, new_option);
-    return old_option;
-}
+// 【已移除】全局函数 setnonblocking, addfd, removefd, modfd
+// 这些现在由 EpollManager 提供
 
-//将内核事件表注册读事件，ET模式，选择开启EPOLLONESHOT
-void addfd(int epollfd, int fd, bool one_shot, int TRIGMode)
-{
-    epoll_event event;
-    event.data.fd = fd;
-
-    if (1 == TRIGMode)
-        event.events = EPOLLIN | EPOLLET | EPOLLRDHUP;
-    else
-        event.events = EPOLLIN | EPOLLRDHUP;
-
-    if (one_shot)
-        event.events |= EPOLLONESHOT;
-    epoll_ctl(epollfd, EPOLL_CTL_ADD, fd, &event);
-    setnonblocking(fd);
-}
-
-//从内核时间表删除描述符
-void removefd(int epollfd, int fd)
-{
-    epoll_ctl(epollfd, EPOLL_CTL_DEL, fd, 0);
-    close(fd);
-}
-
-//将事件重置为EPOLLONESHOT
-void modfd(int epollfd, int fd, int ev, int TRIGMode)
-{
-    epoll_event event;
-    event.data.fd = fd;
-
-    if (1 == TRIGMode)
-        event.events = ev | EPOLLET | EPOLLONESHOT | EPOLLRDHUP;
-    else
-        event.events = ev | EPOLLONESHOT | EPOLLRDHUP;
-
-    epoll_ctl(epollfd, EPOLL_CTL_MOD, fd, &event);
-}
-
-int http_conn::m_user_count = 0;
-int http_conn::m_epollfd = -1;
+// 【已移除】静态成员变量初始化
+// int http_conn::m_user_count = 0;
+// int http_conn::m_epollfd = -1;
 
 //关闭连接，关闭一个连接，客户总量减一
 void http_conn::close_conn(bool real_close)
@@ -103,9 +102,20 @@ void http_conn::close_conn(bool real_close)
     if (real_close && (m_sockfd != -1))
     {
         printf("close %d\n", m_sockfd);
-        removefd(m_epollfd, m_sockfd);
+
+        // 使用 EpollManager 移除 fd
+        if (m_epoll_manager)
+        {
+            m_epoll_manager->removefd(m_sockfd);
+        }
+
         m_sockfd = -1;
-        m_user_count--;
+
+        // 使用 UserManager 减少用户计数
+        if (m_user_manager)
+        {
+            m_user_manager->decrement_user_count();
+        }
     }
 }
 
@@ -116,8 +126,17 @@ void http_conn::init(int sockfd, const sockaddr_in &addr, char *root, int TRIGMo
     m_sockfd = sockfd;
     m_address = addr;
 
-    addfd(m_epollfd, sockfd, true, m_TRIGMode);
-    m_user_count++;
+    // 使用 EpollManager 添加 fd
+    if (m_epoll_manager)
+    {
+        m_epoll_manager->addfd(sockfd, true, TRIGMode);
+    }
+
+    // 使用 UserManager 增加用户计数
+    if (m_user_manager)
+    {
+        m_user_manager->increment_user_count();
+    }
 
     //当浏览器出现连接重置时，可能是网站根目录出错或http响应格式出错或者访问的文件中内容完全为空
     doc_root = root;
@@ -430,29 +449,52 @@ http_conn::HTTP_CODE http_conn::do_request()
             strcat(sql_insert, password);
             strcat(sql_insert, "')");
 
-            if (users.find(name) == users.end())
+            // 使用 UserManager 检查用户是否存在
+            if (m_user_manager && !m_user_manager->has_user(string(name)))
             {
-                m_lock.lock();
-                int res = mysql_query(mysql, sql_insert);
-                users.insert(pair<string, string>(name, password));
-                m_lock.unlock();
-
-                if (!res)
-                    strcpy(m_url, "/log.html");
-                else
+                // 检查 mysql 连接是否有效
+                if (!mysql)
+                {
+                    LOG_ERROR("MySQL connection is NULL during registration");
                     strcpy(m_url, "/registerError.html");
+                }
+                else
+                {
+                    // 使用 UserManager 的锁保护数据库操作
+                    locker &lock = m_user_manager->get_lock();
+                    lock.lock();
+                    int res = mysql_query(mysql, sql_insert);
+                    // 使用不加锁的版本避免死锁
+                    m_user_manager->add_user_unlocked(string(name), string(password));
+                    lock.unlock();
+
+                    if (!res)
+                        strcpy(m_url, "/log.html");
+                    else
+                        strcpy(m_url, "/registerError.html");
+                }
             }
             else
                 strcpy(m_url, "/registerError.html");
+
+            free(sql_insert);
         }
         //如果是登录，直接判断
         //若浏览器端输入的用户名和密码在表中可以查找到，返回1，否则返回0
         else if (*(p + 1) == '2')
         {
-            if (users.find(name) != users.end() && users[name] == password)
+            string stored_password;
+            // 使用 UserManager 查找用户
+            if (m_user_manager &&
+                m_user_manager->find_user(string(name), stored_password) &&
+                stored_password == string(password))
+            {
                 strcpy(m_url, "/welcome.html");
+            }
             else
+            {
                 strcpy(m_url, "/logError.html");
+            }
         }
     }
 
@@ -513,6 +555,7 @@ http_conn::HTTP_CODE http_conn::do_request()
     close(fd);
     return FILE_REQUEST;
 }
+
 void http_conn::unmap()
 {
     if (m_file_address)
@@ -521,13 +564,18 @@ void http_conn::unmap()
         m_file_address = 0;
     }
 }
+
 bool http_conn::write()
 {
     int temp = 0;
 
     if (bytes_to_send == 0)
     {
-        modfd(m_epollfd, m_sockfd, EPOLLIN, m_TRIGMode);
+        // 使用 EpollManager 修改 fd 事件
+        if (m_epoll_manager)
+        {
+            m_epoll_manager->modfd(m_sockfd, EPOLLIN, m_TRIGMode);
+        }
         init();
         return true;
     }
@@ -540,7 +588,11 @@ bool http_conn::write()
         {
             if (errno == EAGAIN)
             {
-                modfd(m_epollfd, m_sockfd, EPOLLOUT, m_TRIGMode);
+                // 使用 EpollManager 修改 fd 事件
+                if (m_epoll_manager)
+                {
+                    m_epoll_manager->modfd(m_sockfd, EPOLLOUT, m_TRIGMode);
+                }
                 return true;
             }
             unmap();
@@ -564,7 +616,11 @@ bool http_conn::write()
         if (bytes_to_send <= 0)
         {
             unmap();
-            modfd(m_epollfd, m_sockfd, EPOLLIN, m_TRIGMode);
+            // 使用 EpollManager 修改 fd 事件
+            if (m_epoll_manager)
+            {
+                m_epoll_manager->modfd(m_sockfd, EPOLLIN, m_TRIGMode);
+            }
 
             if (m_linger)
             {
@@ -578,6 +634,7 @@ bool http_conn::write()
         }
     }
 }
+
 bool http_conn::add_response(const char *format, ...)
 {
     if (m_write_idx >= WRITE_BUFFER_SIZE)
@@ -597,35 +654,43 @@ bool http_conn::add_response(const char *format, ...)
 
     return true;
 }
+
 bool http_conn::add_status_line(int status, const char *title)
 {
     return add_response("%s %d %s\r\n", "HTTP/1.1", status, title);
 }
+
 bool http_conn::add_headers(int content_len)
 {
     return add_content_length(content_len) && add_linger() &&
            add_blank_line();
 }
+
 bool http_conn::add_content_length(int content_len)
 {
     return add_response("Content-Length:%d\r\n", content_len);
 }
+
 bool http_conn::add_content_type()
 {
     return add_response("Content-Type:%s\r\n", "text/html");
 }
+
 bool http_conn::add_linger()
 {
     return add_response("Connection:%s\r\n", (m_linger == true) ? "keep-alive" : "close");
 }
+
 bool http_conn::add_blank_line()
 {
     return add_response("%s", "\r\n");
 }
+
 bool http_conn::add_content(const char *content)
 {
     return add_response("%s", content);
 }
+
 bool http_conn::process_write(HTTP_CODE ret)
 {
     switch (ret)
@@ -685,12 +750,17 @@ bool http_conn::process_write(HTTP_CODE ret)
     bytes_to_send = m_write_idx;
     return true;
 }
+
 void http_conn::process()
 {
     HTTP_CODE read_ret = process_read();
     if (read_ret == NO_REQUEST)
     {
-        modfd(m_epollfd, m_sockfd, EPOLLIN, m_TRIGMode);
+        // 使用 EpollManager 修改 fd 事件
+        if (m_epoll_manager)
+        {
+            m_epoll_manager->modfd(m_sockfd, EPOLLIN, m_TRIGMode);
+        }
         return;
     }
     bool write_ret = process_write(read_ret);
@@ -698,5 +768,9 @@ void http_conn::process()
     {
         close_conn();
     }
-    modfd(m_epollfd, m_sockfd, EPOLLOUT, m_TRIGMode);
+    // 使用 EpollManager 修改 fd 事件
+    if (m_epoll_manager)
+    {
+        m_epoll_manager->modfd(m_sockfd, EPOLLOUT, m_TRIGMode);
+    }
 }

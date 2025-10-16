@@ -1,11 +1,23 @@
 #include "webserver.h"
+#include <cstdlib>  // for getenv
 
 WebServer::WebServer()
 {
-    //http_conn类对象
+    // 创建管理器实例
+    m_epoll_manager = new EpollManager();
+    m_user_manager = new UserManager();
+
+    // 创建 http_conn 对象数组
     users = new http_conn[MAX_FD];
 
-    //root文件夹路径
+    // 为所有 http_conn 对象注入依赖
+    for (int i = 0; i < MAX_FD; ++i)
+    {
+        users[i].set_epoll_manager(m_epoll_manager);
+        users[i].set_user_manager(m_user_manager);
+    }
+
+    // root文件夹路径
     char server_path[200];
     getcwd(server_path, 200);
     char root[6] = "/root";
@@ -13,22 +25,24 @@ WebServer::WebServer()
     strcpy(m_root, server_path);
     strcat(m_root, root);
 
-    //定时器
+    // 定时器
     users_timer = new client_data[MAX_FD];
 }
 
 WebServer::~WebServer()
 {
-    close(m_epollfd);
     close(m_listenfd);
     close(m_pipefd[1]);
     close(m_pipefd[0]);
     delete[] users;
     delete[] users_timer;
     delete m_pool;
+    delete m_epoll_manager;
+    delete m_user_manager;
+    free(m_root);
 }
 
-void WebServer::init(int port, string user, string passWord, string databaseName, int log_write, 
+void WebServer::init(int port, string user, string passWord, string databaseName, int log_write,
                      int opt_linger, int trigmode, int sql_num, int thread_num, int close_log, int actor_model)
 {
     m_port = port;
@@ -88,10 +102,17 @@ void WebServer::sql_pool()
 {
     //初始化数据库连接池
     m_connPool = connection_pool::GetInstance();
-    m_connPool->init("localhost", m_user, m_passWord, m_databaseName, 3306, m_sql_num, m_close_log);
 
-    //初始化数据库读取表
-    users->initmysql_result(m_connPool);
+    // 从环境变量获取数据库主机名，默认为 localhost
+    const char *db_host = getenv("DB_HOST");
+    if (db_host == NULL) {
+        db_host = "localhost";
+    }
+
+    m_connPool->init(db_host, m_user, m_passWord, m_databaseName, 3306, m_sql_num, m_close_log);
+
+    //初始化数据库读取表（只需要在第一个http_conn对象上调用一次）
+    users[0].initmysql_result(m_connPool);
 }
 
 void WebServer::thread_pool()
@@ -132,30 +153,34 @@ void WebServer::eventListen()
     ret = listen(m_listenfd, 5);
     assert(ret >= 0);
 
+    // 初始化 Utils
     utils.init(TIMESLOT);
 
-    //epoll创建内核事件表
-    epoll_event events[MAX_EVENT_NUMBER];
-    m_epollfd = epoll_create(5);
-    assert(m_epollfd != -1);
+    // 创建 epoll 实例
+    m_epoll_manager->create(5);
 
-    utils.addfd(m_epollfd, m_listenfd, false, m_LISTENTrigmode);
-    http_conn::m_epollfd = m_epollfd;
+    // 注册监听 socket
+    m_epoll_manager->addfd(m_listenfd, false, m_LISTENTrigmode);
 
+    // 创建信号管道
     ret = socketpair(PF_UNIX, SOCK_STREAM, 0, m_pipefd);
     assert(ret != -1);
-    utils.setnonblocking(m_pipefd[1]);
-    utils.addfd(m_epollfd, m_pipefd[0], false, 0);
+    EpollManager::setnonblocking(m_pipefd[1]);
+    m_epoll_manager->addfd(m_pipefd[0], false, 0);
 
+    // 设置 Utils 的依赖
+    utils.set_epoll_manager(m_epoll_manager);
+    utils.set_signal_pipe(m_pipefd);
+
+    // 设置全局 Utils 实例（用于信号处理）
+    set_global_utils_instance(&utils);
+
+    // 注册信号
     utils.addsig(SIGPIPE, SIG_IGN);
-    utils.addsig(SIGALRM, utils.sig_handler, false);
-    utils.addsig(SIGTERM, utils.sig_handler, false);
+    utils.addsig(SIGALRM, global_sig_handler, false);
+    utils.addsig(SIGTERM, global_sig_handler, false);
 
     alarm(TIMESLOT);
-
-    //工具类,信号和描述符基础操作
-    Utils::u_pipefd = m_pipefd;
-    Utils::u_epollfd = m_epollfd;
 }
 
 void WebServer::timer(int connfd, struct sockaddr_in client_address)
@@ -169,6 +194,11 @@ void WebServer::timer(int connfd, struct sockaddr_in client_address)
     util_timer *timer = new util_timer;
     timer->user_data = &users_timer[connfd];
     timer->cb_func = cb_func;
+
+    // 设置定时器的依赖注入
+    timer->epoll_manager = m_epoll_manager;
+    timer->user_manager = m_user_manager;
+
     time_t cur = time(NULL);
     timer->expire = cur + 3 * TIMESLOT;
     users_timer[connfd].timer = timer;
@@ -188,7 +218,7 @@ void WebServer::adjust_timer(util_timer *timer)
 
 void WebServer::deal_timer(util_timer *timer, int sockfd)
 {
-    timer->cb_func(&users_timer[sockfd]);
+    timer->cb_func(&users_timer[sockfd], m_epoll_manager, m_user_manager);
     if (timer)
     {
         utils.m_timer_lst.del_timer(timer);
@@ -209,7 +239,7 @@ bool WebServer::dealclientdata()
             LOG_ERROR("%s:errno is:%d", "accept error", errno);
             return false;
         }
-        if (http_conn::m_user_count >= MAX_FD)
+        if (m_user_manager->get_user_count() >= MAX_FD)
         {
             utils.show_error(connfd, "Internal server busy");
             LOG_ERROR("%s", "Internal server busy");
@@ -228,7 +258,7 @@ bool WebServer::dealclientdata()
                 LOG_ERROR("%s:errno is:%d", "accept error", errno);
                 break;
             }
-            if (http_conn::m_user_count >= MAX_FD)
+            if (m_user_manager->get_user_count() >= MAX_FD)
             {
                 utils.show_error(connfd, "Internal server busy");
                 LOG_ERROR("%s", "Internal server busy");
@@ -381,7 +411,7 @@ void WebServer::eventLoop()
 
     while (!stop_server)
     {
-        int number = epoll_wait(m_epollfd, events, MAX_EVENT_NUMBER, -1);
+        int number = m_epoll_manager->wait(events, MAX_EVENT_NUMBER, -1);
         if (number < 0 && errno != EINTR)
         {
             LOG_ERROR("%s", "epoll failure");
