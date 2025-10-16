@@ -418,36 +418,47 @@ http_conn::HTTP_CODE http_conn::do_request()
         //根据标志判断是登录检测还是注册检测
         char flag = m_url[1];
 
-        char *m_url_real = (char *)malloc(sizeof(char) * 200);
-        strcpy(m_url_real, "/");
-        strcat(m_url_real, m_url + 2);
-        strncpy(m_real_file + len, m_url_real, FILENAME_LEN - len - 1);
-        free(m_url_real);
+        // 优化：使用栈内存，避免 malloc/free
+        char url_buffer[256];
+        snprintf(url_buffer, sizeof(url_buffer), "/%s", m_url + 2);
+        strncpy(m_real_file + len, url_buffer, FILENAME_LEN - len - 1);
 
-        //将用户名和密码提取出来
+        //将用户名和密码提取出来 - 带边界检查防止缓冲区溢出
         //user=123&passwd=123
+        const int MAX_FIELD_LEN = 99;
         char name[100], password[100];
-        int i;
-        for (i = 5; m_string[i] != '&'; ++i)
-            name[i - 5] = m_string[i];
-        name[i - 5] = '\0';
+        int i, j = 0;
 
-        int j = 0;
-        for (i = i + 10; m_string[i] != '\0'; ++i, ++j)
+        // 解析用户名: user=<name>&
+        for (i = 5; m_string[i] != '&' && m_string[i] != '\0' && j < MAX_FIELD_LEN; ++i, ++j)
+            name[j] = m_string[i];
+        name[j] = '\0';
+
+        // 检查解析是否成功
+        if (m_string[i] != '&' || j == 0 || j >= MAX_FIELD_LEN) {
+            LOG_ERROR("Invalid username format: too long or malformed");
+            strcpy(m_url, "/registerError.html");
+            return do_request();  // 直接返回错误页面
+        }
+
+        // 解析密码: passwd=<password>
+        i += 8;  // 跳过 "&passwd="
+        j = 0;
+        for (; m_string[i] != '\0' && m_string[i] != '&' && j < MAX_FIELD_LEN; ++i, ++j)
             password[j] = m_string[i];
         password[j] = '\0';
+
+        // 检查密码
+        if (j == 0 || j >= MAX_FIELD_LEN) {
+            LOG_ERROR("Invalid password format: too long or empty");
+            strcpy(m_url, "/registerError.html");
+            return do_request();
+        }
 
         if (*(p + 1) == '3')
         {
             //如果是注册，先检测数据库中是否有重名的
             //没有重名的，进行增加数据
-            char *sql_insert = (char *)malloc(sizeof(char) * 200);
-            strcpy(sql_insert, "INSERT INTO user(username, passwd) VALUES(");
-            strcat(sql_insert, "'");
-            strcat(sql_insert, name);
-            strcat(sql_insert, "', '");
-            strcat(sql_insert, password);
-            strcat(sql_insert, "')");
 
             // 使用 UserManager 检查用户是否存在
             if (m_user_manager && !m_user_manager->has_user(string(name)))
@@ -460,24 +471,77 @@ http_conn::HTTP_CODE http_conn::do_request()
                 }
                 else
                 {
-                    // 使用 UserManager 的锁保护数据库操作
-                    locker &lock = m_user_manager->get_lock();
-                    lock.lock();
-                    int res = mysql_query(mysql, sql_insert);
-                    // 使用不加锁的版本避免死锁
-                    m_user_manager->add_user_unlocked(string(name), string(password));
-                    lock.unlock();
-
-                    if (!res)
-                        strcpy(m_url, "/log.html");
-                    else
+                    // 使用 MySQL 预处理语句防止 SQL 注入
+                    MYSQL_STMT *stmt = mysql_stmt_init(mysql);
+                    if (!stmt)
+                    {
+                        LOG_ERROR("mysql_stmt_init failed");
                         strcpy(m_url, "/registerError.html");
+                    }
+                    else
+                    {
+                        const char *query = "INSERT INTO user(username, passwd) VALUES(?, ?)";
+                        if (mysql_stmt_prepare(stmt, query, strlen(query)) != 0)
+                        {
+                            LOG_ERROR("mysql_stmt_prepare failed: %s", mysql_stmt_error(stmt));
+                            mysql_stmt_close(stmt);
+                            strcpy(m_url, "/registerError.html");
+                        }
+                        else
+                        {
+                            // 绑定参数
+                            MYSQL_BIND bind[2];
+                            memset(bind, 0, sizeof(bind));
+
+                            unsigned long name_len = strlen(name);
+                            unsigned long password_len = strlen(password);
+
+                            bind[0].buffer_type = MYSQL_TYPE_STRING;
+                            bind[0].buffer = name;
+                            bind[0].buffer_length = name_len;
+                            bind[0].length = &name_len;
+
+                            bind[1].buffer_type = MYSQL_TYPE_STRING;
+                            bind[1].buffer = password;
+                            bind[1].buffer_length = password_len;
+                            bind[1].length = &password_len;
+
+                            if (mysql_stmt_bind_param(stmt, bind) != 0)
+                            {
+                                LOG_ERROR("mysql_stmt_bind_param failed: %s", mysql_stmt_error(stmt));
+                                mysql_stmt_close(stmt);
+                                strcpy(m_url, "/registerError.html");
+                            }
+                            else
+                            {
+                                // 执行并获取锁
+                                locker &lock = m_user_manager->get_lock();
+                                lock.lock();
+
+                                int res = mysql_stmt_execute(stmt);
+                                // 使用不加锁的版本避免死锁
+                                if (res == 0)
+                                {
+                                    m_user_manager->add_user_unlocked(string(name), string(password));
+                                }
+
+                                lock.unlock();
+                                mysql_stmt_close(stmt);
+
+                                if (res == 0)
+                                    strcpy(m_url, "/log.html");
+                                else
+                                {
+                                    LOG_ERROR("mysql_stmt_execute failed: %s", mysql_error(mysql));
+                                    strcpy(m_url, "/registerError.html");
+                                }
+                            }
+                        }
+                    }
                 }
             }
             else
                 strcpy(m_url, "/registerError.html");
-
-            free(sql_insert);
         }
         //如果是登录，直接判断
         //若浏览器端输入的用户名和密码在表中可以查找到，返回1，否则返回0
@@ -498,46 +562,21 @@ http_conn::HTTP_CODE http_conn::do_request()
         }
     }
 
+    // 优化：使用栈内存统一处理路由，避免多次 malloc/free
+    const char *target_page = NULL;
     if (*(p + 1) == '0')
-    {
-        char *m_url_real = (char *)malloc(sizeof(char) * 200);
-        strcpy(m_url_real, "/register.html");
-        strncpy(m_real_file + len, m_url_real, strlen(m_url_real));
-
-        free(m_url_real);
-    }
+        target_page = "/register.html";
     else if (*(p + 1) == '1')
-    {
-        char *m_url_real = (char *)malloc(sizeof(char) * 200);
-        strcpy(m_url_real, "/log.html");
-        strncpy(m_real_file + len, m_url_real, strlen(m_url_real));
-
-        free(m_url_real);
-    }
+        target_page = "/log.html";
     else if (*(p + 1) == '5')
-    {
-        char *m_url_real = (char *)malloc(sizeof(char) * 200);
-        strcpy(m_url_real, "/picture.html");
-        strncpy(m_real_file + len, m_url_real, strlen(m_url_real));
-
-        free(m_url_real);
-    }
+        target_page = "/picture.html";
     else if (*(p + 1) == '6')
-    {
-        char *m_url_real = (char *)malloc(sizeof(char) * 200);
-        strcpy(m_url_real, "/video.html");
-        strncpy(m_real_file + len, m_url_real, strlen(m_url_real));
-
-        free(m_url_real);
-    }
+        target_page = "/video.html";
     else if (*(p + 1) == '7')
-    {
-        char *m_url_real = (char *)malloc(sizeof(char) * 200);
-        strcpy(m_url_real, "/fans.html");
-        strncpy(m_real_file + len, m_url_real, strlen(m_url_real));
+        target_page = "/fans.html";
 
-        free(m_url_real);
-    }
+    if (target_page)
+        strncpy(m_real_file + len, target_page, FILENAME_LEN - len - 1);
     else
         strncpy(m_real_file + len, m_url, FILENAME_LEN - len - 1);
 

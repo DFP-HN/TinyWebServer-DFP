@@ -2,10 +2,12 @@
 
 UserManager::UserManager() : m_user_count(0)
 {
+    pthread_rwlock_init(&m_rwlock, NULL);
 }
 
 UserManager::~UserManager()
 {
+    pthread_rwlock_destroy(&m_rwlock);
 }
 
 void UserManager::increment_user_count()
@@ -24,9 +26,9 @@ void UserManager::decrement_user_count()
 
 void UserManager::set_users(const map<string, string> &users)
 {
-    m_lock.lock();
+    pthread_rwlock_wrlock(&m_rwlock);
     m_users = users;
-    m_lock.unlock();
+    pthread_rwlock_unlock(&m_rwlock);
 }
 
 map<string, string> &UserManager::get_users()
@@ -41,30 +43,39 @@ const map<string, string> &UserManager::get_users() const
 
 bool UserManager::find_user(const string &username, string &password) const
 {
+    // 使用读锁：允许多个线程同时查找用户（提升并发性能）
+    pthread_rwlock_rdlock(&m_rwlock);
     map<string, string>::const_iterator it = m_users.find(username);
+    bool found = false;
     if (it != m_users.end())
     {
         password = it->second;
-        return true;
+        found = true;
     }
-    return false;
+    pthread_rwlock_unlock(&m_rwlock);
+    return found;
 }
 
 bool UserManager::has_user(const string &username) const
 {
-    return m_users.find(username) != m_users.end();
+    // 使用读锁：允许多个线程同时查询
+    pthread_rwlock_rdlock(&m_rwlock);
+    bool exists = m_users.find(username) != m_users.end();
+    pthread_rwlock_unlock(&m_rwlock);
+    return exists;
 }
 
 bool UserManager::add_user(const string &username, const string &password)
 {
-    m_lock.lock();
+    // 使用写锁
+    pthread_rwlock_wrlock(&m_rwlock);
     if (m_users.find(username) == m_users.end())
     {
         m_users[username] = password;
-        m_lock.unlock();
+        pthread_rwlock_unlock(&m_rwlock);
         return true;
     }
-    m_lock.unlock();
+    pthread_rwlock_unlock(&m_rwlock);
     return false;
 }
 
