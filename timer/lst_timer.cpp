@@ -1,11 +1,13 @@
 #include "lst_timer.h"
-#include "../http/http_conn.h"
+#include "../epoll/epoll_manager.h"
+#include "../user/user_manager.h"
 
 sort_timer_lst::sort_timer_lst()
 {
     head = NULL;
     tail = NULL;
 }
+
 sort_timer_lst::~sort_timer_lst()
 {
     util_timer *tmp = head;
@@ -37,6 +39,7 @@ void sort_timer_lst::add_timer(util_timer *timer)
     }
     add_timer(timer, head);
 }
+
 void sort_timer_lst::adjust_timer(util_timer *timer)
 {
     if (!timer)
@@ -62,6 +65,7 @@ void sort_timer_lst::adjust_timer(util_timer *timer)
         add_timer(timer, timer->next);
     }
 }
+
 void sort_timer_lst::del_timer(util_timer *timer)
 {
     if (!timer)
@@ -93,13 +97,14 @@ void sort_timer_lst::del_timer(util_timer *timer)
     timer->next->prev = timer->prev;
     delete timer;
 }
+
 void sort_timer_lst::tick()
 {
     if (!head)
     {
         return;
     }
-    
+
     time_t cur = time(NULL);
     util_timer *tmp = head;
     while (tmp)
@@ -108,7 +113,8 @@ void sort_timer_lst::tick()
         {
             break;
         }
-        tmp->cb_func(tmp->user_data);
+        // 调用回调函数，传递依赖注入的对象
+        tmp->cb_func(tmp->user_data, tmp->epoll_manager, tmp->user_manager);
         head = tmp->next;
         if (head)
         {
@@ -145,48 +151,56 @@ void sort_timer_lst::add_timer(util_timer *timer, util_timer *lst_head)
     }
 }
 
+Utils::Utils() : m_TIMESLOT(0), m_pipefd(NULL), m_epoll_manager(NULL)
+{
+}
+
+Utils::~Utils()
+{
+}
+
 void Utils::init(int timeslot)
 {
     m_TIMESLOT = timeslot;
 }
 
-//对文件描述符设置非阻塞
-int Utils::setnonblocking(int fd)
+void Utils::set_epoll_manager(EpollManager *epoll_mgr)
 {
-    int old_option = fcntl(fd, F_GETFL);
-    int new_option = old_option | O_NONBLOCK;
-    fcntl(fd, F_SETFL, new_option);
-    return old_option;
+    m_epoll_manager = epoll_mgr;
 }
 
-//将内核事件表注册读事件，ET模式，选择开启EPOLLONESHOT
-void Utils::addfd(int epollfd, int fd, bool one_shot, int TRIGMode)
+void Utils::set_signal_pipe(int *pipefd)
 {
-    epoll_event event;
-    event.data.fd = fd;
-
-    if (1 == TRIGMode)
-        event.events = EPOLLIN | EPOLLET | EPOLLRDHUP;
-    else
-        event.events = EPOLLIN | EPOLLRDHUP;
-
-    if (one_shot)
-        event.events |= EPOLLONESHOT;
-    epoll_ctl(epollfd, EPOLL_CTL_ADD, fd, &event);
-    setnonblocking(fd);
+    m_pipefd = pipefd;
 }
 
-//信号处理函数
+// 信号处理函数 - 现在是非静态的，但需要通过全局函数桥接
+// 因为信号处理函数必须是普通函数指针
 void Utils::sig_handler(int sig)
 {
-    //为保证函数的可重入性，保留原来的errno
+    // 为保证函数的可重入性，保留原来的errno
     int save_errno = errno;
     int msg = sig;
-    send(u_pipefd[1], (char *)&msg, 1, 0);
+    if (m_pipefd)
+    {
+        send(m_pipefd[1], (char *)&msg, 1, 0);
+    }
     errno = save_errno;
 }
 
-//设置信号函数
+// 全局Utils实例指针，用于信号处理函数桥接
+static Utils *g_utils_instance = NULL;
+
+// 全局信号处理函数，桥接到Utils实例
+static void global_sig_handler(int sig)
+{
+    if (g_utils_instance)
+    {
+        g_utils_instance->sig_handler(sig);
+    }
+}
+
+// 设置信号函数
 void Utils::addsig(int sig, void(handler)(int), bool restart)
 {
     struct sigaction sa;
@@ -198,7 +212,7 @@ void Utils::addsig(int sig, void(handler)(int), bool restart)
     assert(sigaction(sig, &sa, NULL) != -1);
 }
 
-//定时处理任务，重新定时以不断触发SIGALRM信号
+// 定时处理任务，重新定时以不断触发SIGALRM信号
 void Utils::timer_handler()
 {
     m_timer_lst.tick();
@@ -211,14 +225,22 @@ void Utils::show_error(int connfd, const char *info)
     close(connfd);
 }
 
-int *Utils::u_pipefd = 0;
-int Utils::u_epollfd = 0;
-
-class Utils;
-void cb_func(client_data *user_data)
+// 重构后的回调函数 - 使用依赖注入的对象
+void cb_func(client_data *user_data, EpollManager *epoll_mgr, UserManager *user_mgr)
 {
-    epoll_ctl(Utils::u_epollfd, EPOLL_CTL_DEL, user_data->sockfd, 0);
+    if (epoll_mgr)
+    {
+        epoll_mgr->removefd(user_data->sockfd);
+    }
     assert(user_data);
-    close(user_data->sockfd);
-    http_conn::m_user_count--;
+    if (user_mgr)
+    {
+        user_mgr->decrement_user_count();
+    }
+}
+
+// 设置全局Utils实例（用于信号处理）
+void set_global_utils_instance(Utils *utils)
+{
+    g_utils_instance = utils;
 }

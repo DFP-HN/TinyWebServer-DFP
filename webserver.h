@@ -14,11 +14,16 @@
 
 #include "./threadpool/threadpool.h"
 #include "./http/http_conn.h"
+#include "./epoll/epoll_manager.h"
+#include "./user/user_manager.h"
+#include "./timer/lst_timer.h"
 
 const int MAX_FD = 65536;           //最大文件描述符
 const int MAX_EVENT_NUMBER = 10000; //最大事件数
 const int TIMESLOT = 5;             //最小超时单位
 
+// 重构后的WebServer类
+// 使用依赖注入，消除静态耦合
 class WebServer
 {
 public:
@@ -52,7 +57,6 @@ public:
     int m_actormodel;
 
     int m_pipefd[2];
-    int m_epollfd;
     http_conn *users;
 
     //数据库相关
@@ -78,5 +82,10 @@ public:
     //定时器相关
     client_data *users_timer;
     Utils utils;
+
+    // 依赖注入的管理器
+    EpollManager *m_epoll_manager;  // epoll操作管理器
+    UserManager *m_user_manager;    // 用户管理器
 };
+
 #endif

@@ -1,5 +1,5 @@
-#ifndef LST_TIMER
-#define LST_TIMER
+#ifndef LST_TIMER_H
+#define LST_TIMER_H
 
 #include <unistd.h>
 #include <signal.h>
@@ -25,6 +25,8 @@
 #include "../log/log.h"
 
 class util_timer;
+class EpollManager;
+class UserManager;
 
 struct client_data
 {
@@ -33,6 +35,10 @@ struct client_data
     util_timer *timer;
 };
 
+// 定时器回调函数类型
+// 使用依赖注入的方式，移除全局静态变量访问
+typedef void (*timer_callback)(client_data *user_data, EpollManager *epoll_mgr, UserManager *user_mgr);
+
 class util_timer
 {
 public:
@@ -40,11 +46,15 @@ public:
 
 public:
     time_t expire;
-    
-    void (* cb_func)(client_data *);
+
+    timer_callback cb_func;
     client_data *user_data;
     util_timer *prev;
     util_timer *next;
+
+    // 保存依赖注入的指针
+    EpollManager *epoll_manager;
+    UserManager *user_manager;
 };
 
 class sort_timer_lst
@@ -65,38 +75,43 @@ private:
     util_timer *tail;
 };
 
+// 重构后的Utils类 - 移除静态成员
 class Utils
 {
 public:
-    Utils() {}
-    ~Utils() {}
+    Utils();
+    ~Utils();
 
     void init(int timeslot);
 
-    //对文件描述符设置非阻塞
-    int setnonblocking(int fd);
+    // 依赖注入
+    void set_epoll_manager(EpollManager *epoll_mgr);
+    void set_signal_pipe(int *pipefd);
 
-    //将内核事件表注册读事件，ET模式，选择开启EPOLLONESHOT
-    void addfd(int epollfd, int fd, bool one_shot, int TRIGMode);
+    // 信号处理函数 - 改为非静态
+    void sig_handler(int sig);
 
-    //信号处理函数
-    static void sig_handler(int sig);
-
-    //设置信号函数
+    // 设置信号函数
     void addsig(int sig, void(handler)(int), bool restart = true);
 
-    //定时处理任务，重新定时以不断触发SIGALRM信号
+    // 定时处理任务，重新定时以不断触发SIGALRM信号
     void timer_handler();
 
     void show_error(int connfd, const char *info);
 
 public:
-    static int *u_pipefd;
     sort_timer_lst m_timer_lst;
-    static int u_epollfd;
     int m_TIMESLOT;
+
+private:
+    int *m_pipefd;              // 依赖注入的管道fd
+    EpollManager *m_epoll_manager; // 依赖注入的epoll管理器
 };
 
-void cb_func(client_data *user_data);
+// 重构后的回调函数
+void cb_func(client_data *user_data, EpollManager *epoll_mgr, UserManager *user_mgr);
+
+// 设置全局Utils实例（用于信号处理）
+void set_global_utils_instance(Utils *utils);
 
 #endif

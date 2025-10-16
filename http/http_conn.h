@@ -26,6 +26,10 @@
 #include "../timer/lst_timer.h"
 #include "../log/log.h"
 
+// 前向声明
+class EpollManager;
+class UserManager;
+
 class http_conn
 {
 public:
@@ -69,10 +73,14 @@ public:
     };
 
 public:
-    http_conn() {}
-    ~http_conn() {}
+    http_conn();
+    ~http_conn();
 
 public:
+    // 注入依赖：EpollManager 和 UserManager
+    void set_epoll_manager(EpollManager *epoll_mgr);
+    void set_user_manager(UserManager *user_mgr);
+
     void init(int sockfd, const sockaddr_in &addr, char *, int, int, string user, string passwd, string sqlname);
     void close_conn(bool real_close = true);
     void process();
@@ -108,8 +116,10 @@ private:
     bool add_blank_line();
 
 public:
-    static int m_epollfd;
-    static int m_user_count;
+    // 移除静态成员，改为依赖注入
+    // static int m_epollfd;      // 已移除
+    // static int m_user_count;   // 已移除
+
     MYSQL *mysql;
     int m_state;  //读为0, 写为1
 
@@ -147,6 +157,10 @@ private:
     char sql_user[100];
     char sql_passwd[100];
     char sql_name[100];
+
+    // 依赖注入的成员
+    EpollManager *m_epoll_manager;
+    UserManager *m_user_manager;
 };
 
 #endif
