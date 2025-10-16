@@ -19,6 +19,7 @@
 #include <errno.h>
 #include <sys/wait.h>
 #include <sys/uio.h>
+#include <sys/sendfile.h>  // 零拷贝优化
 #include <map>
 
 #include "../lock/locker.h"
@@ -148,6 +149,10 @@ private:
     char *m_string; //存储请求头数据
     int bytes_to_send;
     int bytes_have_send;
+
+    // 零拷贝优化：使用 sendfile 发送静态文件
+    int m_file_fd;      // 文件描述符（用于 sendfile）
+    bool m_use_sendfile; // 是否使用 sendfile 优化
     char *doc_root;
 
     map<string, string> m_users;

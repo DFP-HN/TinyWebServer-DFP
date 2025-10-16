@@ -173,6 +173,10 @@ void http_conn::init()
     timer_flag = 0;
     improv = 0;
 
+    // 零拷贝优化初始化
+    m_file_fd = -1;
+    m_use_sendfile = false;
+
     memset(m_read_buf, '\0', READ_BUFFER_SIZE);
     memset(m_write_buf, '\0', WRITE_BUFFER_SIZE);
     memset(m_real_file, '\0', FILENAME_LEN);
@@ -589,19 +593,57 @@ http_conn::HTTP_CODE http_conn::do_request()
     if (S_ISDIR(m_file_stat.st_mode))
         return BAD_REQUEST;
 
-    int fd = open(m_real_file, O_RDONLY);
-    m_file_address = (char *)mmap(0, m_file_stat.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
-    close(fd);
+    // 零拷贝优化：保持文件描述符打开，用于 sendfile
+    m_file_fd = open(m_real_file, O_RDONLY);
+    if (m_file_fd < 0)
+        return NO_RESOURCE;
+
+    // 根据文件大小决定使用 sendfile 还是 mmap
+    // sendfile 对大文件更高效（避免用户空间拷贝）
+    const off_t SENDFILE_THRESHOLD = 64 * 1024; // 64KB 阈值
+
+    if (m_file_stat.st_size >= SENDFILE_THRESHOLD)
+    {
+        // 使用 sendfile 零拷贝优化（大文件）
+        m_use_sendfile = true;
+        m_file_address = NULL; // 不需要 mmap
+    }
+    else
+    {
+        // 使用传统 mmap 方式（小文件，mmap 开销可接受）
+        m_use_sendfile = false;
+        m_file_address = (char *)mmap(0, m_file_stat.st_size, PROT_READ, MAP_PRIVATE, m_file_fd, 0);
+        if (m_file_address == MAP_FAILED)
+        {
+            close(m_file_fd);
+            m_file_fd = -1;
+            return NO_RESOURCE;
+        }
+        // 小文件可以关闭 fd，mmap 已经建立映射
+        close(m_file_fd);
+        m_file_fd = -1;
+    }
+
     return FILE_REQUEST;
 }
 
 void http_conn::unmap()
 {
+    // 清理 mmap 映射
     if (m_file_address)
     {
         munmap(m_file_address, m_file_stat.st_size);
         m_file_address = 0;
     }
+
+    // 清理 sendfile 文件描述符
+    if (m_file_fd >= 0)
+    {
+        close(m_file_fd);
+        m_file_fd = -1;
+    }
+
+    m_use_sendfile = false;
 }
 
 bool http_conn::write()
@@ -619,56 +661,144 @@ bool http_conn::write()
         return true;
     }
 
-    while (1)
+    // 零拷贝优化：使用 sendfile 发送大文件
+    if (m_use_sendfile && m_file_fd >= 0)
     {
-        temp = writev(m_sockfd, m_iv, m_iv_count);
-
-        if (temp < 0)
+        while (1)
         {
-            if (errno == EAGAIN)
+            // 第一步：发送 HTTP 响应头（如果还未发送完）
+            if (m_write_idx > 0 && bytes_have_send < m_write_idx)
             {
-                // 使用 EpollManager 修改 fd 事件
-                if (m_epoll_manager)
+                temp = send(m_sockfd, m_write_buf + bytes_have_send, m_write_idx - bytes_have_send, 0);
+                if (temp < 0)
                 {
-                    m_epoll_manager->modfd(m_sockfd, EPOLLOUT, m_TRIGMode);
+                    if (errno == EAGAIN)
+                    {
+                        if (m_epoll_manager)
+                        {
+                            m_epoll_manager->modfd(m_sockfd, EPOLLOUT, m_TRIGMode);
+                        }
+                        return true;
+                    }
+                    unmap();
+                    return false;
                 }
-                return true;
-            }
-            unmap();
-            return false;
-        }
-
-        bytes_have_send += temp;
-        bytes_to_send -= temp;
-        if (bytes_have_send >= m_iv[0].iov_len)
-        {
-            m_iv[0].iov_len = 0;
-            m_iv[1].iov_base = m_file_address + (bytes_have_send - m_write_idx);
-            m_iv[1].iov_len = bytes_to_send;
-        }
-        else
-        {
-            m_iv[0].iov_base = m_write_buf + bytes_have_send;
-            m_iv[0].iov_len = m_iv[0].iov_len - bytes_have_send;
-        }
-
-        if (bytes_to_send <= 0)
-        {
-            unmap();
-            // 使用 EpollManager 修改 fd 事件
-            if (m_epoll_manager)
-            {
-                m_epoll_manager->modfd(m_sockfd, EPOLLIN, m_TRIGMode);
+                bytes_have_send += temp;
+                bytes_to_send -= temp;
+                continue; // 继续发送剩余的响应头
             }
 
-            if (m_linger)
+            // 第二步：使用 sendfile 零拷贝发送文件内容
+            off_t offset = bytes_have_send - m_write_idx; // 文件中的偏移量
+            off_t remaining = m_file_stat.st_size - offset;
+
+            if (remaining > 0)
             {
-                init();
-                return true;
+                temp = sendfile(m_sockfd, m_file_fd, &offset, remaining);
+                if (temp < 0)
+                {
+                    if (errno == EAGAIN)
+                    {
+                        // sendfile 会自动更新 offset，需要同步
+                        bytes_have_send = m_write_idx + offset;
+                        bytes_to_send = m_file_stat.st_size - offset;
+                        if (m_epoll_manager)
+                        {
+                            m_epoll_manager->modfd(m_sockfd, EPOLLOUT, m_TRIGMode);
+                        }
+                        return true;
+                    }
+                    unmap();
+                    return false;
+                }
+                else if (temp == 0)
+                {
+                    // 发送完成
+                    break;
+                }
+
+                // sendfile 自动更新了 offset
+                bytes_have_send = m_write_idx + offset;
+                bytes_to_send -= temp;
             }
             else
             {
+                // 文件发送完成
+                break;
+            }
+        }
+
+        // 发送完成
+        unmap();
+        if (m_epoll_manager)
+        {
+            m_epoll_manager->modfd(m_sockfd, EPOLLIN, m_TRIGMode);
+        }
+
+        if (m_linger)
+        {
+            init();
+            return true;
+        }
+        else
+        {
+            return false;
+        }
+    }
+    else
+    {
+        // 传统方式：使用 writev 发送（mmap + writev）
+        while (1)
+        {
+            temp = writev(m_sockfd, m_iv, m_iv_count);
+
+            if (temp < 0)
+            {
+                if (errno == EAGAIN)
+                {
+                    // 使用 EpollManager 修改 fd 事件
+                    if (m_epoll_manager)
+                    {
+                        m_epoll_manager->modfd(m_sockfd, EPOLLOUT, m_TRIGMode);
+                    }
+                    return true;
+                }
+                unmap();
                 return false;
+            }
+
+            bytes_have_send += temp;
+            bytes_to_send -= temp;
+            if (bytes_have_send >= m_iv[0].iov_len)
+            {
+                m_iv[0].iov_len = 0;
+                m_iv[1].iov_base = m_file_address + (bytes_have_send - m_write_idx);
+                m_iv[1].iov_len = bytes_to_send;
+            }
+            else
+            {
+                m_iv[0].iov_base = m_write_buf + bytes_have_send;
+                m_iv[0].iov_len = m_iv[0].iov_len - bytes_have_send;
+            }
+
+            if (bytes_to_send <= 0)
+            {
+                unmap();
+                // 使用 EpollManager 修改 fd 事件
+                if (m_epoll_manager)
+                {
+                    m_epoll_manager->modfd(m_sockfd, EPOLLIN, m_TRIGMode);
+                }
+
+                if (m_linger)
+                {
+                    init();
+                    return true;
+                }
+                else
+                {
+                    return false;
+                }
             }
         }
     }
