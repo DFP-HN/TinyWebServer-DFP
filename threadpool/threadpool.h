@@ -101,52 +101,88 @@ void threadpool<T>::run()
 {
     while (true)
     {
+        // 批处理优化：一次性取出多个任务，减少锁竞争
+        // 设置批处理大小为 4（可根据实际负载调整）
+        const int BATCH_SIZE = 4;
+        std::list<T*> local_batch;
+
+        // 第一个任务通过信号量等待
         m_queuestat.wait();
+
         m_queuelocker.lock();
         if (m_workqueue.empty())
         {
             m_queuelocker.unlock();
             continue;
         }
-        T *request = m_workqueue.front();
+
+        // 批量取出任务到本地队列（最多 BATCH_SIZE 个）
+        // 第一个任务已经通过信号量获取，直接取出
+        local_batch.push_back(m_workqueue.front());
         m_workqueue.pop_front();
-        m_queuelocker.unlock();
-        if (!request)
-            continue;
-        if (1 == m_actor_model)
+
+        // 尝试额外取出更多任务（非阻塞）
+        int batch_count = 1;
+        while (!m_workqueue.empty() && batch_count < BATCH_SIZE)
         {
-            if (0 == request->m_state)
+            // 额外的任务也需要对应的信号量计数
+            if (m_queuestat.trywait())  // 尝试非阻塞获取信号量
             {
-                if (request->read_once())
+                local_batch.push_back(m_workqueue.front());
+                m_workqueue.pop_front();
+                batch_count++;
+            }
+            else
+            {
+                break;  // 没有更多信号量，停止批量取出
+            }
+        }
+        m_queuelocker.unlock();
+
+        // 处理本地批次的所有任务（无需持有全局锁）
+        for (typename std::list<T*>::iterator it = local_batch.begin();
+             it != local_batch.end(); ++it)
+        {
+            T *request = *it;
+            if (!request)
+                continue;
+
+            // 处理单个任务
+            if (1 == m_actor_model)
+            {
+                if (0 == request->m_state)
                 {
-                    request->improv = 1;
-                    connectionRAII mysqlcon(&request->mysql, m_connPool);
-                    request->process();
+                    if (request->read_once())
+                    {
+                        request->improv = 1;
+                        connectionRAII mysqlcon(&request->mysql, m_connPool);
+                        request->process();
+                    }
+                    else
+                    {
+                        request->improv = 1;
+                        request->timer_flag = 1;
+                    }
                 }
                 else
                 {
-                    request->improv = 1;
-                    request->timer_flag = 1;
+                    if (request->write())
+                    {
+                        request->improv = 1;
+                    }
+                    else
+                    {
+                        request->improv = 1;
+                        request->timer_flag = 1;
+                    }
                 }
             }
             else
             {
-                if (request->write())
-                {
-                    request->improv = 1;
-                }
-                else
-                {
-                    request->improv = 1;
-                    request->timer_flag = 1;
-                }
+                connectionRAII mysqlcon(&request->mysql, m_connPool);
+                request->process();
             }
-        }
-        else
-        {
-            connectionRAII mysqlcon(&request->mysql, m_connPool);
-            request->process();
-        }
-    }
+        } // end for loop
+    } // end while true
 }
 #endif

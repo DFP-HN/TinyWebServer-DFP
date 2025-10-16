@@ -8,6 +8,7 @@
 #include <string.h>
 #include <iostream>
 #include <string>
+#include <atomic>  // 原子计数器优化
 #include "../lock/locker.h"
 #include "../log/log.h"
 
@@ -31,9 +32,13 @@ private:
 	~connection_pool();
 
 	int m_MaxConn;  //最大连接数
-	int m_CurConn;  //当前已使用的连接数
-	int m_FreeConn; //当前空闲的连接数
-	locker lock;
+
+	// 原子计数器优化：避免锁竞争
+	// 使用 atomic 替代普通 int，在查询时无需加锁
+	atomic<int> m_CurConn;  //当前已使用的连接数
+	atomic<int> m_FreeConn; //当前空闲的连接数
+
+	locker lock;  // 只保护 connList，不保护计数器
 	list<MYSQL *> connList; //连接池
 	sem reserve;
 

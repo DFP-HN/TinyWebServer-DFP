@@ -30,6 +30,11 @@ public:
     {
         return sem_wait(&m_sem) == 0;
     }
+    // 非阻塞等待：用于批处理优化
+    bool trywait()
+    {
+        return sem_trywait(&m_sem) == 0;
+    }
     bool post()
     {
         return sem_post(&m_sem) == 0;

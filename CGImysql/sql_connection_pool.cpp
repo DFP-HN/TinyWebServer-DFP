@@ -12,8 +12,9 @@ using namespace std;
 
 connection_pool::connection_pool()
 {
-	m_CurConn = 0;
-	m_FreeConn = 0;
+	// 原子变量初始化
+	m_CurConn.store(0, std::memory_order_relaxed);
+	m_FreeConn.store(0, std::memory_order_relaxed);
 }
 
 connection_pool *connection_pool::GetInstance()
@@ -50,12 +51,13 @@ void connection_pool::init(string url, string User, string PassWord, string DBNa
 			exit(1);
 		}
 		connList.push_back(con);
-		++m_FreeConn;
+		// 原子操作：无锁增加空闲连接数
+		m_FreeConn.fetch_add(1, std::memory_order_relaxed);
 	}
 
-	reserve = sem(m_FreeConn);
+	reserve = sem(m_FreeConn.load(std::memory_order_relaxed));
 
-	m_MaxConn = m_FreeConn;
+	m_MaxConn = m_FreeConn.load(std::memory_order_relaxed);
 }
 
 
@@ -68,16 +70,17 @@ MYSQL *connection_pool::GetConnection()
 		return NULL;
 
 	reserve.wait();
-	
-	lock.lock();
 
+	// 优化：锁只保护队列操作，计数器使用原子操作
+	lock.lock();
 	con = connList.front();
 	connList.pop_front();
-
-	--m_FreeConn;
-	++m_CurConn;
-
 	lock.unlock();
+
+	// 原子操作：无锁更新计数器（性能提升关键点）
+	m_FreeConn.fetch_sub(1, std::memory_order_relaxed);
+	m_CurConn.fetch_add(1, std::memory_order_relaxed);
+
 	return con;
 }
 
@@ -87,13 +90,14 @@ bool connection_pool::ReleaseConnection(MYSQL *con)
 	if (NULL == con)
 		return false;
 
+	// 优化：锁只保护队列操作
 	lock.lock();
-
 	connList.push_back(con);
-	++m_FreeConn;
-	--m_CurConn;
-
 	lock.unlock();
+
+	// 原子操作：无锁更新计数器
+	m_FreeConn.fetch_add(1, std::memory_order_relaxed);
+	m_CurConn.fetch_sub(1, std::memory_order_relaxed);
 
 	reserve.post();
 	return true;
@@ -112,8 +116,9 @@ void connection_pool::DestroyPool()
 			MYSQL *con = *it;
 			mysql_close(con);
 		}
-		m_CurConn = 0;
-		m_FreeConn = 0;
+		// 原子操作：重置计数器
+		m_CurConn.store(0, std::memory_order_relaxed);
+		m_FreeConn.store(0, std::memory_order_relaxed);
 		connList.clear();
 	}
 
@@ -123,7 +128,9 @@ void connection_pool::DestroyPool()
 //当前空闲的连接数
 int connection_pool::GetFreeConn()
 {
-	return this->m_FreeConn;
+	// 原子操作：无锁读取（性能提升关键点）
+	// 之前每次查询都需要加锁，现在直接原子读取
+	return this->m_FreeConn.load(std::memory_order_relaxed);
 }
 
 connection_pool::~connection_pool()
