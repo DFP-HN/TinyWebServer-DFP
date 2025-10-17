@@ -23,6 +23,8 @@
 
 #include <time.h>
 #include <memory>  // 智能指针
+#include <vector>
+#include <unordered_map>
 #include "../log/log.h"
 
 class util_timer;
@@ -58,6 +60,7 @@ public:
     UserManager *user_manager;
 };
 
+// 排序链表定时器（旧实现）
 class sort_timer_lst
 {
 public:
@@ -74,6 +77,39 @@ private:
 
     std::shared_ptr<util_timer> head;  // 使用智能指针
     std::shared_ptr<util_timer> tail;  // 使用智能指针
+};
+
+// 最小堆定时器（新实现 - 高性能）
+class heap_timer_lst
+{
+public:
+    heap_timer_lst();
+    ~heap_timer_lst();
+
+    // 兼容接口
+    void add_timer(std::shared_ptr<util_timer> timer);
+    void adjust_timer(std::shared_ptr<util_timer> timer);
+    void del_timer(std::shared_ptr<util_timer> timer);
+    void tick();
+
+    // 堆操作性能：O(log n)
+    size_t size() const { return m_heap.size(); }
+    bool empty() const { return m_heap.empty(); }
+
+private:
+    // 堆操作
+    void sift_up(size_t pos);
+    void sift_down(size_t pos);
+    void swap_timers(size_t i, size_t j);
+
+    // 辅助函数
+    size_t parent(size_t i) const { return (i - 1) / 2; }
+    size_t left_child(size_t i) const { return 2 * i + 1; }
+    size_t right_child(size_t i) const { return 2 * i + 2; }
+
+private:
+    std::vector<std::shared_ptr<util_timer>> m_heap;            // 最小堆存储
+    std::unordered_map<util_timer*, size_t> m_timer_pos;        // 快速索引
 };
 
 // 重构后的Utils类 - 移除静态成员
@@ -101,7 +137,7 @@ public:
     void show_error(int connfd, const char *info);
 
 public:
-    sort_timer_lst m_timer_lst;
+    heap_timer_lst m_timer_lst;  // 使用堆定时器（高性能）
     int m_TIMESLOT;
 
 private:
