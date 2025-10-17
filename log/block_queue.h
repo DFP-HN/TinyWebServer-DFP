@@ -1,136 +1,139 @@
 /*************************************************************
-*循环数组实现的阻塞队列，m_back = (m_back + 1) % m_max_size;  
-*线程安全，每个操作前都要先加互斥锁，操作完后，再解锁
-**************************************************************/
+ * 重构后的阻塞队列 - 使用智能指针和RAII
+ *
+ * 改进：
+ * 1. 使用 std::vector 替代原始指针数组
+ * 2. RAII 锁管理，异常安全
+ * 3. 抛出异常替代 exit(-1)
+ * 4. 保持线程安全和接口兼容
+ *************************************************************/
 
 #ifndef BLOCK_QUEUE_H
 #define BLOCK_QUEUE_H
 
 #include <iostream>
-#include <stdlib.h>
+#include <vector>
+#include <stdexcept>
 #include <pthread.h>
 #include <sys/time.h>
 #include "../lock/locker.h"
-using namespace std;
+
+// RAII 锁管理辅助类
+class LockGuard
+{
+public:
+    explicit LockGuard(locker& lock) : m_lock(lock)
+    {
+        m_lock.lock();
+    }
+    ~LockGuard()
+    {
+        m_lock.unlock();
+    }
+
+    // 禁用拷贝
+    LockGuard(const LockGuard&) = delete;
+    LockGuard& operator=(const LockGuard&) = delete;
+
+private:
+    locker& m_lock;
+};
 
 template <class T>
 class block_queue
 {
 public:
-    block_queue(int max_size = 1000)
+    // 构造函数 - 抛出异常而不是 exit
+    explicit block_queue(int max_size = 1000)
+        : m_max_size(max_size), m_size(0), m_front(-1), m_back(-1)
     {
         if (max_size <= 0)
         {
-            exit(-1);
+            throw std::invalid_argument("block_queue: max_size must be positive");
         }
 
-        m_max_size = max_size;
-        m_array = new T[max_size];
-        m_size = 0;
-        m_front = -1;
-        m_back = -1;
+        m_array.resize(max_size);
     }
 
+    // 禁用拷贝构造和赋值（队列不应被拷贝）
+    block_queue(const block_queue&) = delete;
+    block_queue& operator=(const block_queue&) = delete;
+
+    // 清空队列
     void clear()
     {
-        m_mutex.lock();
+        LockGuard lock(m_mutex);
         m_size = 0;
         m_front = -1;
         m_back = -1;
-        m_mutex.unlock();
     }
 
+    // 析构函数 - RAII 自动管理资源
     ~block_queue()
     {
-        m_mutex.lock();
-        if (m_array != NULL)
-            delete [] m_array;
+        clear();
+    }
 
-        m_mutex.unlock();
-    }
-    //判断队列是否满了
-    bool full() 
+    // 判断队列是否满
+    bool full()
     {
-        m_mutex.lock();
-        if (m_size >= m_max_size)
-        {
+        LockGuard lock(m_mutex);
+        return m_size >= m_max_size;
+    }
 
-            m_mutex.unlock();
-            return true;
-        }
-        m_mutex.unlock();
-        return false;
-    }
-    //判断队列是否为空
-    bool empty() 
+    // 判断队列是否为空
+    bool empty()
     {
-        m_mutex.lock();
-        if (0 == m_size)
-        {
-            m_mutex.unlock();
-            return true;
-        }
-        m_mutex.unlock();
-        return false;
+        LockGuard lock(m_mutex);
+        return m_size == 0;
     }
-    //返回队首元素
-    bool front(T &value) 
+
+    // 返回队首元素
+    bool front(T &value)
     {
-        m_mutex.lock();
-        if (0 == m_size)
+        LockGuard lock(m_mutex);
+        if (m_size == 0)
         {
-            m_mutex.unlock();
             return false;
         }
         value = m_array[m_front];
-        m_mutex.unlock();
         return true;
     }
-    //返回队尾元素
-    bool back(T &value) 
+
+    // 返回队尾元素
+    bool back(T &value)
     {
-        m_mutex.lock();
-        if (0 == m_size)
+        LockGuard lock(m_mutex);
+        if (m_size == 0)
         {
-            m_mutex.unlock();
             return false;
         }
         value = m_array[m_back];
-        m_mutex.unlock();
         return true;
     }
 
-    int size() 
+    // 当前队列大小
+    int size()
     {
-        int tmp = 0;
-
-        m_mutex.lock();
-        tmp = m_size;
-
-        m_mutex.unlock();
-        return tmp;
+        LockGuard lock(m_mutex);
+        return m_size;
     }
 
+    // 最大队列大小
     int max_size()
     {
-        int tmp = 0;
-
-        m_mutex.lock();
-        tmp = m_max_size;
-
-        m_mutex.unlock();
-        return tmp;
+        LockGuard lock(m_mutex);
+        return m_max_size;
     }
-    //往队列添加元素，需要将所有使用队列的线程先唤醒
-    //当有元素push进队列,相当于生产者生产了一个元素
-    //若当前没有线程等待条件变量,则唤醒无意义
+
+    // 添加元素到队列
+    // 当队列满时，唤醒所有等待线程并返回false
     bool push(const T &item)
     {
+        m_mutex.lock();  // 手动锁定（因为需要在广播前解锁）
 
-        m_mutex.lock();
         if (m_size >= m_max_size)
         {
-
             m_cond.broadcast();
             m_mutex.unlock();
             return false;
@@ -138,21 +141,21 @@ public:
 
         m_back = (m_back + 1) % m_max_size;
         m_array[m_back] = item;
-
         m_size++;
 
-        m_cond.broadcast();
+        m_cond.broadcast();  // 唤醒等待的消费者
         m_mutex.unlock();
         return true;
     }
-    //pop时,如果当前队列没有元素,将会等待条件变量
+
+    // 从队列取出元素（阻塞）
+    // 如果队列为空，等待条件变量
     bool pop(T &item)
     {
-
         m_mutex.lock();
+
         while (m_size <= 0)
         {
-            
             if (!m_cond.wait(m_mutex.get()))
             {
                 m_mutex.unlock();
@@ -163,21 +166,25 @@ public:
         m_front = (m_front + 1) % m_max_size;
         item = m_array[m_front];
         m_size--;
+
         m_mutex.unlock();
         return true;
     }
 
-    //增加了超时处理
+    // 从队列取出元素（超时）
     bool pop(T &item, int ms_timeout)
     {
         struct timespec t = {0, 0};
         struct timeval now = {0, 0};
         gettimeofday(&now, NULL);
+
         m_mutex.lock();
+
         if (m_size <= 0)
         {
             t.tv_sec = now.tv_sec + ms_timeout / 1000;
-            t.tv_nsec = (ms_timeout % 1000) * 1000;
+            t.tv_nsec = (ms_timeout % 1000) * 1000000;  // 修正：微秒转纳秒
+
             if (!m_cond.timewait(m_mutex.get(), t))
             {
                 m_mutex.unlock();
@@ -194,15 +201,16 @@ public:
         m_front = (m_front + 1) % m_max_size;
         item = m_array[m_front];
         m_size--;
+
         m_mutex.unlock();
         return true;
     }
 
 private:
-    locker m_mutex;
+    mutable locker m_mutex;  // mutable 允许在 const 函数中加锁
     cond m_cond;
 
-    T *m_array;
+    std::vector<T> m_array;  // 使用 vector 自动管理内存
     int m_size;
     int m_max_size;
     int m_front;

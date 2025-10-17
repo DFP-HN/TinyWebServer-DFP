@@ -3,67 +3,103 @@
 #include <sys/time.h>
 #include <stdarg.h>
 #include "log.h"
-#include <pthread.h>
+
 using namespace std;
 
+// 全局Log实例指针（用于向后兼容）
+Log* g_log_instance = nullptr;
+
 Log::Log()
+    : m_count(0),
+      m_split_lines(0),
+      m_log_buf_size(0),
+      m_today(0),
+      m_is_async(false),
+      m_close_log(0),
+      m_stop_thread(false)
 {
-    m_count = 0;
-    m_is_async = false;
 }
 
 Log::~Log()
 {
-    if (m_fp != NULL)
+    // 停止异步写线程
+    if (m_write_thread && m_write_thread->joinable())
     {
-        fclose(m_fp);
+        m_stop_thread = true;
+
+        // 如果有阻塞队列，推送一个空字符串唤醒线程
+        if (m_log_queue)
+        {
+            m_log_queue->push("");
+        }
+
+        m_write_thread->join();
     }
+
+    // 智能指针自动释放资源：m_fp, m_buf, m_log_queue, m_write_thread
 }
-//异步需要设置阻塞队列的长度，同步不需要设置
-bool Log::init(const char *file_name, int close_log, int log_buf_size, int split_lines, int max_queue_size)
+
+bool Log::init(const char *file_name, int close_log, int log_buf_size,
+               int split_lines, int max_queue_size)
 {
-    //如果设置了max_queue_size,则设置为异步
+    // 如果设置了max_queue_size，则设置为异步
     if (max_queue_size >= 1)
     {
         m_is_async = true;
-        m_log_queue = new block_queue<string>(max_queue_size);
-        pthread_t tid;
-        //flush_log_thread为回调函数,这里表示创建线程异步写日志
-        pthread_create(&tid, NULL, flush_log_thread, NULL);
+
+        // 使用智能指针创建阻塞队列
+        try
+        {
+            m_log_queue = std::make_unique<block_queue<string>>(max_queue_size);
+        }
+        catch (const std::exception& e)
+        {
+            cerr << "Failed to create log queue: " << e.what() << endl;
+            return false;
+        }
+
+        // 创建异步写线程
+        m_write_thread = std::make_unique<std::thread>(&Log::async_write_log, this);
     }
-    
+
     m_close_log = close_log;
     m_log_buf_size = log_buf_size;
-    m_buf = new char[m_log_buf_size];
-    memset(m_buf, '\0', m_log_buf_size);
+    m_buf = std::make_unique<char[]>(m_log_buf_size);  // 智能指针管理缓冲区
+    memset(m_buf.get(), '\0', m_log_buf_size);
     m_split_lines = split_lines;
 
     time_t t = time(NULL);
     struct tm *sys_tm = localtime(&t);
     struct tm my_tm = *sys_tm;
 
- 
     const char *p = strrchr(file_name, '/');
     char log_full_name[256] = {0};
 
     if (p == NULL)
     {
-        snprintf(log_full_name, 255, "%d_%02d_%02d_%s", my_tm.tm_year + 1900, my_tm.tm_mon + 1, my_tm.tm_mday, file_name);
+        snprintf(log_full_name, 255, "%d_%02d_%02d_%s",
+                 my_tm.tm_year + 1900, my_tm.tm_mon + 1, my_tm.tm_mday, file_name);
+        m_dir_name = "";
+        m_log_name = file_name;
     }
     else
     {
-        strcpy(log_name, p + 1);
-        strncpy(dir_name, file_name, p - file_name + 1);
-        snprintf(log_full_name, 255, "%s%d_%02d_%02d_%s", dir_name, my_tm.tm_year + 1900, my_tm.tm_mon + 1, my_tm.tm_mday, log_name);
+        m_log_name = p + 1;
+        m_dir_name = string(file_name, p - file_name + 1);
+        snprintf(log_full_name, 255, "%s%d_%02d_%02d_%s",
+                 m_dir_name.c_str(), my_tm.tm_year + 1900, my_tm.tm_mon + 1,
+                 my_tm.tm_mday, m_log_name.c_str());
     }
 
     m_today = my_tm.tm_mday;
-    
-    m_fp = fopen(log_full_name, "a");
-    if (m_fp == NULL)
+
+    // 使用智能指针管理文件
+    FILE* fp = fopen(log_full_name, "a");
+    if (fp == NULL)
     {
         return false;
     }
+    m_fp.reset(fp);  // 智能指针接管所有权
 
     return true;
 }
@@ -75,90 +111,132 @@ void Log::write_log(int level, const char *format, ...)
     time_t t = now.tv_sec;
     struct tm *sys_tm = localtime(&t);
     struct tm my_tm = *sys_tm;
-    char s[16] = {0};
+
+    // 日志级别字符串
+    const char* level_str;
     switch (level)
     {
-    case 0:
-        strcpy(s, "[debug]:");
+    case DEBUG:
+        level_str = "[debug]:";
         break;
-    case 1:
-        strcpy(s, "[info]:");
+    case INFO:
+        level_str = "[info]:";
         break;
-    case 2:
-        strcpy(s, "[warn]:");
+    case WARN:
+        level_str = "[warn]:";
         break;
-    case 3:
-        strcpy(s, "[erro]:");
+    case ERROR:
+        level_str = "[erro]:";
         break;
     default:
-        strcpy(s, "[info]:");
+        level_str = "[info]:";
         break;
     }
-    //写入一个log，对m_count++, m_split_lines最大行数
-    m_mutex.lock();
-    m_count++;
 
-    if (m_today != my_tm.tm_mday || m_count % m_split_lines == 0) //everyday log
+    // 日志行数递增，检查是否需要切换文件
     {
-        
-        char new_log[256] = {0};
-        fflush(m_fp);
-        fclose(m_fp);
-        char tail[16] = {0};
-       
-        snprintf(tail, 16, "%d_%02d_%02d_", my_tm.tm_year + 1900, my_tm.tm_mon + 1, my_tm.tm_mday);
-       
-        if (m_today != my_tm.tm_mday)
-        {
-            snprintf(new_log, 255, "%s%s%s", dir_name, tail, log_name);
-            m_today = my_tm.tm_mday;
-            m_count = 0;
-        }
-        else
-        {
-            snprintf(new_log, 255, "%s%s%s.%lld", dir_name, tail, log_name, m_count / m_split_lines);
-        }
-        m_fp = fopen(new_log, "a");
-    }
- 
-    m_mutex.unlock();
+        LockGuard lock(m_mutex);
+        m_count++;
 
+        if (m_today != my_tm.tm_mday || m_count % m_split_lines == 0)
+        {
+            char new_log[256] = {0};
+            fflush(m_fp.get());
+
+            char tail[16] = {0};
+            snprintf(tail, 16, "%d_%02d_%02d_",
+                     my_tm.tm_year + 1900, my_tm.tm_mon + 1, my_tm.tm_mday);
+
+            if (m_today != my_tm.tm_mday)
+            {
+                snprintf(new_log, 255, "%s%s%s",
+                         m_dir_name.c_str(), tail, m_log_name.c_str());
+                m_today = my_tm.tm_mday;
+                m_count = 0;
+            }
+            else
+            {
+                snprintf(new_log, 255, "%s%s%s.%lld",
+                         m_dir_name.c_str(), tail, m_log_name.c_str(),
+                         m_count / m_split_lines);
+            }
+
+            // 重新打开文件
+            FILE* fp = fopen(new_log, "a");
+            if (fp != NULL)
+            {
+                m_fp.reset(fp);  // 智能指针自动关闭旧文件并接管新文件
+            }
+        }
+    }
+
+    // 格式化日志内容
     va_list valst;
     va_start(valst, format);
 
     string log_str;
-    m_mutex.lock();
+    {
+        LockGuard lock(m_mutex);
 
-    //写入的具体时间内容格式
-    int n = snprintf(m_buf, 48, "%d-%02d-%02d %02d:%02d:%02d.%06ld %s ",
-                     my_tm.tm_year + 1900, my_tm.tm_mon + 1, my_tm.tm_mday,
-                     my_tm.tm_hour, my_tm.tm_min, my_tm.tm_sec, now.tv_usec, s);
-    
-    int m = vsnprintf(m_buf + n, m_log_buf_size - n - 1, format, valst);
-    m_buf[n + m] = '\n';
-    m_buf[n + m + 1] = '\0';
-    log_str = m_buf;
+        // 写入时间戳和日志级别
+        int n = snprintf(m_buf.get(), 48, "%d-%02d-%02d %02d:%02d:%02d.%06ld %s ",
+                         my_tm.tm_year + 1900, my_tm.tm_mon + 1, my_tm.tm_mday,
+                         my_tm.tm_hour, my_tm.tm_min, my_tm.tm_sec, now.tv_usec,
+                         level_str);
 
-    m_mutex.unlock();
+        int m = vsnprintf(m_buf.get() + n, m_log_buf_size - n - 1, format, valst);
+        m_buf[n + m] = '\n';
+        m_buf[n + m + 1] = '\0';
+        log_str = m_buf.get();
+    }
 
-    if (m_is_async && !m_log_queue->full())
+    va_end(valst);
+
+    // 根据是否异步决定写入方式
+    if (m_is_async && m_log_queue && !m_log_queue->full())
     {
         m_log_queue->push(log_str);
     }
     else
     {
-        m_mutex.lock();
-        fputs(log_str.c_str(), m_fp);
-        m_mutex.unlock();
+        LockGuard lock(m_mutex);
+        if (m_fp)
+        {
+            fputs(log_str.c_str(), m_fp.get());
+        }
     }
-
-    va_end(valst);
 }
 
 void Log::flush(void)
 {
-    m_mutex.lock();
-    //强制刷新写入流缓冲区
-    fflush(m_fp);
-    m_mutex.unlock();
+    LockGuard lock(m_mutex);
+    if (m_fp)
+    {
+        fflush(m_fp.get());
+    }
+}
+
+// 异步写日志线程函数
+void Log::async_write_log()
+{
+    string single_log;
+
+    // 从阻塞队列中取出日志并写入文件
+    while (!m_stop_thread)
+    {
+        if (m_log_queue->pop(single_log))
+        {
+            // 空字符串是停止信号
+            if (single_log.empty() && m_stop_thread)
+            {
+                break;
+            }
+
+            LockGuard lock(m_mutex);
+            if (m_fp)
+            {
+                fputs(single_log.c_str(), m_fp.get());
+            }
+        }
+    }
 }
