@@ -22,6 +22,7 @@
 #include <sys/uio.h>
 
 #include <time.h>
+#include <memory>  // 智能指针
 #include "../log/log.h"
 
 class util_timer;
@@ -32,7 +33,7 @@ struct client_data
 {
     sockaddr_in address;
     int sockfd;
-    util_timer *timer;
+    std::shared_ptr<util_timer> timer;  // 使用智能指针管理定时器
 };
 
 // 定时器回调函数类型
@@ -42,15 +43,15 @@ typedef void (*timer_callback)(client_data *user_data, EpollManager *epoll_mgr, 
 class util_timer
 {
 public:
-    util_timer() : prev(NULL), next(NULL) {}
+    util_timer() : prev(nullptr), next(nullptr) {}
 
 public:
     time_t expire;
 
     timer_callback cb_func;
     client_data *user_data;
-    util_timer *prev;
-    util_timer *next;
+    std::shared_ptr<util_timer> prev;  // 使用智能指针
+    std::shared_ptr<util_timer> next;  // 使用智能指针
 
     // 保存依赖注入的指针
     EpollManager *epoll_manager;
@@ -63,16 +64,16 @@ public:
     sort_timer_lst();
     ~sort_timer_lst();
 
-    void add_timer(util_timer *timer);
-    void adjust_timer(util_timer *timer);
-    void del_timer(util_timer *timer);
+    void add_timer(std::shared_ptr<util_timer> timer);
+    void adjust_timer(std::shared_ptr<util_timer> timer);
+    void del_timer(std::shared_ptr<util_timer> timer);
     void tick();
 
 private:
-    void add_timer(util_timer *timer, util_timer *lst_head);
+    void add_timer(std::shared_ptr<util_timer> timer, std::shared_ptr<util_timer> lst_head);
 
-    util_timer *head;
-    util_timer *tail;
+    std::shared_ptr<util_timer> head;  // 使用智能指针
+    std::shared_ptr<util_timer> tail;  // 使用智能指针
 };
 
 // 重构后的Utils类 - 移除静态成员

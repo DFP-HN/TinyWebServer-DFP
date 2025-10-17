@@ -4,22 +4,27 @@
 
 sort_timer_lst::sort_timer_lst()
 {
-    head = NULL;
-    tail = NULL;
+    head = nullptr;
+    tail = nullptr;
 }
 
 sort_timer_lst::~sort_timer_lst()
 {
-    util_timer *tmp = head;
-    while (tmp)
+    // 智能指针自动释放，只需断开链表
+    while (head)
     {
-        head = tmp->next;
-        delete tmp;
-        tmp = head;
+        auto tmp = head;
+        head = head->next;
+        if (head)
+        {
+            head->prev = nullptr;  // 断开反向引用
+        }
+        tmp->next = nullptr;  // 断开正向引用，释放智能指针
     }
+    tail = nullptr;
 }
 
-void sort_timer_lst::add_timer(util_timer *timer)
+void sort_timer_lst::add_timer(std::shared_ptr<util_timer> timer)
 {
     if (!timer)
     {
@@ -40,13 +45,13 @@ void sort_timer_lst::add_timer(util_timer *timer)
     add_timer(timer, head);
 }
 
-void sort_timer_lst::adjust_timer(util_timer *timer)
+void sort_timer_lst::adjust_timer(std::shared_ptr<util_timer> timer)
 {
     if (!timer)
     {
         return;
     }
-    util_timer *tmp = timer->next;
+    auto tmp = timer->next;
     if (!tmp || (timer->expire < tmp->expire))
     {
         return;
@@ -54,19 +59,32 @@ void sort_timer_lst::adjust_timer(util_timer *timer)
     if (timer == head)
     {
         head = head->next;
-        head->prev = NULL;
-        timer->next = NULL;
+        if (head)
+        {
+            head->prev = nullptr;
+        }
+        timer->next = nullptr;
         add_timer(timer, head);
     }
     else
     {
-        timer->prev->next = timer->next;
-        timer->next->prev = timer->prev;
-        add_timer(timer, timer->next);
+        auto prev_timer = timer->prev;
+        auto next_timer = timer->next;
+        if (prev_timer)
+        {
+            prev_timer->next = next_timer;
+        }
+        if (next_timer)
+        {
+            next_timer->prev = prev_timer;
+        }
+        timer->prev = nullptr;
+        timer->next = nullptr;
+        add_timer(timer, next_timer);
     }
 }
 
-void sort_timer_lst::del_timer(util_timer *timer)
+void sort_timer_lst::del_timer(std::shared_ptr<util_timer> timer)
 {
     if (!timer)
     {
@@ -74,28 +92,41 @@ void sort_timer_lst::del_timer(util_timer *timer)
     }
     if ((timer == head) && (timer == tail))
     {
-        delete timer;
-        head = NULL;
-        tail = NULL;
-        return;
+        head = nullptr;
+        tail = nullptr;
+        return;  // 智能指针自动释放
     }
     if (timer == head)
     {
         head = head->next;
-        head->prev = NULL;
-        delete timer;
-        return;
+        if (head)
+        {
+            head->prev = nullptr;
+        }
+        return;  // 智能指针自动释放
     }
     if (timer == tail)
     {
         tail = tail->prev;
-        tail->next = NULL;
-        delete timer;
-        return;
+        if (tail)
+        {
+            tail->next = nullptr;
+        }
+        return;  // 智能指针自动释放
     }
-    timer->prev->next = timer->next;
-    timer->next->prev = timer->prev;
-    delete timer;
+    auto prev_timer = timer->prev;
+    auto next_timer = timer->next;
+    if (prev_timer)
+    {
+        prev_timer->next = next_timer;
+    }
+    if (next_timer)
+    {
+        next_timer->prev = prev_timer;
+    }
+    timer->prev = nullptr;
+    timer->next = nullptr;
+    // 智能指针自动释放
 }
 
 void sort_timer_lst::tick()
@@ -106,7 +137,7 @@ void sort_timer_lst::tick()
     }
 
     time_t cur = time(NULL);
-    util_timer *tmp = head;
+    auto tmp = head;
     while (tmp)
     {
         if (cur < tmp->expire)
@@ -118,17 +149,17 @@ void sort_timer_lst::tick()
         head = tmp->next;
         if (head)
         {
-            head->prev = NULL;
+            head->prev = nullptr;
         }
-        delete tmp;
-        tmp = head;
+        tmp->next = nullptr;  // 断开引用
+        tmp = head;  // 智能指针自动释放旧的 tmp
     }
 }
 
-void sort_timer_lst::add_timer(util_timer *timer, util_timer *lst_head)
+void sort_timer_lst::add_timer(std::shared_ptr<util_timer> timer, std::shared_ptr<util_timer> lst_head)
 {
-    util_timer *prev = lst_head;
-    util_timer *tmp = prev->next;
+    auto prev = lst_head;
+    auto tmp = prev->next;
     while (tmp)
     {
         if (timer->expire < tmp->expire)
@@ -146,7 +177,7 @@ void sort_timer_lst::add_timer(util_timer *timer, util_timer *lst_head)
     {
         prev->next = timer;
         timer->prev = prev;
-        timer->next = NULL;
+        timer->next = nullptr;
         tail = timer;
     }
 }

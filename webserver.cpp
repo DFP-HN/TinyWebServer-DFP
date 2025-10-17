@@ -3,30 +3,31 @@
 
 WebServer::WebServer()
 {
-    // 创建管理器实例
-    m_epoll_manager = new EpollManager();
-    m_user_manager = new UserManager();
+    // 创建管理器实例（使用 make_unique 智能指针）
+    m_epoll_manager = std::make_unique<EpollManager>();
+    m_user_manager = std::make_unique<UserManager>();
 
-    // 创建 http_conn 对象数组
-    users = new http_conn[MAX_FD];
+    // 创建 http_conn 对象数组（使用智能指针）
+    users = std::make_unique<http_conn[]>(MAX_FD);
 
     // 为所有 http_conn 对象注入依赖
     for (int i = 0; i < MAX_FD; ++i)
     {
-        users[i].set_epoll_manager(m_epoll_manager);
-        users[i].set_user_manager(m_user_manager);
+        users[i].set_epoll_manager(m_epoll_manager.get());
+        users[i].set_user_manager(m_user_manager.get());
     }
 
-    // root文件夹路径
+    // root文件夹路径（使用智能指针）
     char server_path[200];
     getcwd(server_path, 200);
     char root[6] = "/root";
-    m_root = (char *)malloc(strlen(server_path) + strlen(root) + 1);
-    strcpy(m_root, server_path);
-    strcat(m_root, root);
+    size_t root_len = strlen(server_path) + strlen(root) + 1;
+    m_root = std::make_unique<char[]>(root_len);
+    strcpy(m_root.get(), server_path);
+    strcat(m_root.get(), root);
 
-    // 定时器
-    users_timer = new client_data[MAX_FD];
+    // 定时器（使用智能指针）
+    users_timer = std::make_unique<client_data[]>(MAX_FD);
 }
 
 WebServer::~WebServer()
@@ -34,12 +35,9 @@ WebServer::~WebServer()
     close(m_listenfd);
     close(m_pipefd[1]);
     close(m_pipefd[0]);
-    delete[] users;
-    delete[] users_timer;
-    delete m_pool;
-    delete m_epoll_manager;
-    delete m_user_manager;
-    free(m_root);
+    // 智能指针自动释放，无需手动 delete
+    // users、users_timer、m_pool、m_epoll_manager、m_user_manager、m_root
+    // 都会自动调用析构函数
 }
 
 void WebServer::init(int port, string user, string passWord, string databaseName, int log_write,
@@ -117,8 +115,8 @@ void WebServer::sql_pool()
 
 void WebServer::thread_pool()
 {
-    //线程池
-    m_pool = new threadpool<http_conn>(m_actormodel, m_connPool, m_thread_num);
+    //线程池（使用智能指针）
+    m_pool = std::make_unique<threadpool<http_conn>>(m_actormodel, m_connPool, m_thread_num);
 }
 
 void WebServer::eventListen()
@@ -168,8 +166,8 @@ void WebServer::eventListen()
     EpollManager::setnonblocking(m_pipefd[1]);
     m_epoll_manager->addfd(m_pipefd[0], false, 0);
 
-    // 设置 Utils 的依赖
-    utils.set_epoll_manager(m_epoll_manager);
+    // 设置 Utils 的依赖（智能指针用 .get() 获取原始指针）
+    utils.set_epoll_manager(m_epoll_manager.get());
     utils.set_signal_pipe(m_pipefd);
 
     // 设置全局 Utils 实例（用于信号处理）
@@ -185,29 +183,31 @@ void WebServer::eventListen()
 
 void WebServer::timer(int connfd, struct sockaddr_in client_address)
 {
-    users[connfd].init(connfd, client_address, m_root, m_CONNTrigmode, m_close_log, m_user, m_passWord, m_databaseName);
+    users[connfd].init(connfd, client_address, m_root.get(), m_CONNTrigmode, m_close_log, m_user, m_passWord, m_databaseName);
 
     //初始化client_data数据
     //创建定时器，设置回调函数和超时时间，绑定用户数据，将定时器添加到链表中
     users_timer[connfd].address = client_address;
     users_timer[connfd].sockfd = connfd;
-    util_timer *timer = new util_timer;
+
+    // 使用智能指针创建定时器
+    auto timer = std::make_shared<util_timer>();
     timer->user_data = &users_timer[connfd];
     timer->cb_func = cb_func;
 
-    // 设置定时器的依赖注入
-    timer->epoll_manager = m_epoll_manager;
-    timer->user_manager = m_user_manager;
+    // 设置定时器的依赖注入（智能指针用 .get() 获取原始指针）
+    timer->epoll_manager = m_epoll_manager.get();
+    timer->user_manager = m_user_manager.get();
 
     time_t cur = time(NULL);
     timer->expire = cur + 3 * TIMESLOT;
-    users_timer[connfd].timer = timer;
+    users_timer[connfd].timer = timer;  // shared_ptr 赋值
     utils.m_timer_lst.add_timer(timer);
 }
 
 //若有数据传输，则将定时器往后延迟3个单位
 //并对新的定时器在链表上的位置进行调整
-void WebServer::adjust_timer(util_timer *timer)
+void WebServer::adjust_timer(std::shared_ptr<util_timer> timer)
 {
     time_t cur = time(NULL);
     timer->expire = cur + 3 * TIMESLOT;
@@ -216,9 +216,9 @@ void WebServer::adjust_timer(util_timer *timer)
     LOG_INFO("%s", "adjust timer once");
 }
 
-void WebServer::deal_timer(util_timer *timer, int sockfd)
+void WebServer::deal_timer(std::shared_ptr<util_timer> timer, int sockfd)
 {
-    timer->cb_func(&users_timer[sockfd], m_epoll_manager, m_user_manager);
+    timer->cb_func(&users_timer[sockfd], m_epoll_manager.get(), m_user_manager.get());
     if (timer)
     {
         utils.m_timer_lst.del_timer(timer);
@@ -309,7 +309,7 @@ bool WebServer::dealwithsignal(bool &timeout, bool &stop_server)
 
 void WebServer::dealwithread(int sockfd)
 {
-    util_timer *timer = users_timer[sockfd].timer;
+    auto timer = users_timer[sockfd].timer;  // shared_ptr
 
     //reactor
     if (1 == m_actormodel)
@@ -320,7 +320,7 @@ void WebServer::dealwithread(int sockfd)
         }
 
         //若监测到读事件，将该事件放入请求队列
-        m_pool->append(users + sockfd, 0);
+        m_pool->append(&users[sockfd], 0);
 
         while (true)
         {
@@ -344,7 +344,7 @@ void WebServer::dealwithread(int sockfd)
             LOG_INFO("deal with the client(%s)", inet_ntoa(users[sockfd].get_address()->sin_addr));
 
             //若监测到读事件，将该事件放入请求队列
-            m_pool->append_p(users + sockfd);
+            m_pool->append_p(&users[sockfd]);
 
             if (timer)
             {
@@ -360,7 +360,7 @@ void WebServer::dealwithread(int sockfd)
 
 void WebServer::dealwithwrite(int sockfd)
 {
-    util_timer *timer = users_timer[sockfd].timer;
+    auto timer = users_timer[sockfd].timer;  // shared_ptr
     //reactor
     if (1 == m_actormodel)
     {
@@ -369,7 +369,7 @@ void WebServer::dealwithwrite(int sockfd)
             adjust_timer(timer);
         }
 
-        m_pool->append(users + sockfd, 1);
+        m_pool->append(&users[sockfd], 1);
 
         while (true)
         {
@@ -432,7 +432,7 @@ void WebServer::eventLoop()
             else if (events[i].events & (EPOLLRDHUP | EPOLLHUP | EPOLLERR))
             {
                 //服务器端关闭连接，移除对应的定时器
-                util_timer *timer = users_timer[sockfd].timer;
+                auto timer = users_timer[sockfd].timer;  // shared_ptr
                 deal_timer(timer, sockfd);
             }
             //处理信号
