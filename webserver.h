@@ -22,7 +22,7 @@
 
 const int MAX_FD = 65536;           //最大文件描述符
 const int MAX_EVENT_NUMBER = 10000; //最大事件数
-const int TIMESLOT = 5;             //最小超时单位
+const int TIMESLOT = 10;            //最小超时单位（优化为10秒，Keep-Alive超时为3*TIMESLOT=30秒）
 
 // 重构后的WebServer类
 // 使用依赖注入，消除静态耦合

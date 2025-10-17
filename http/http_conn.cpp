@@ -623,12 +623,15 @@ http_conn::HTTP_CODE http_conn::do_request()
         std::shared_ptr<CacheEntry> cached = m_static_cache->get(std::string(m_real_file));
         if (cached && cached->last_modified == m_file_stat.st_mtime)
         {
-            // 缓存命中且未过期
+            // 保存ETag用于响应
+            m_cached_etag = cached->etag;
+
             // 检查ETag（304 Not Modified）
             if (m_if_none_match && strcmp(m_if_none_match, cached->etag.c_str()) == 0)
             {
-                // ETag匹配，返回304（这里简化处理，实际应在process_write中处理）
-                // 暂时还是返回FILE_REQUEST，在process_write中检查
+                // ETag匹配，返回304（将在process_write中处理）
+                m_use_cache = true;
+                return FILE_REQUEST;
             }
 
             // 使用缓存内容
@@ -676,6 +679,13 @@ http_conn::HTTP_CODE http_conn::do_request()
                                 m_file_address,
                                 m_file_stat.st_size,
                                 m_file_stat.st_mtime);
+
+            // 获取刚放入缓存的ETag
+            auto cached = m_static_cache->get(std::string(m_real_file));
+            if (cached)
+            {
+                m_cached_etag = cached->etag;
+            }
         }
 
         // 小文件可以关闭 fd，mmap 已经建立映射
@@ -891,8 +901,27 @@ bool http_conn::add_status_line(int status, const char *title)
 
 bool http_conn::add_headers(int content_len)
 {
-    return add_content_length(content_len) && add_linger() &&
-           add_blank_line();
+    if (!add_content_type_auto())  // 自动识别Content-Type
+        return false;
+    if (!add_content_length(content_len))
+        return false;
+    if (!add_linger())
+        return false;
+
+    // 对于静态资源添加缓存控制
+    if (m_method == GET && cgi == 0)
+    {
+        // Cache-Control: 静态资源缓存1小时
+        add_cache_control("public, max-age=3600");
+
+        // 如果有ETag，添加到响应头
+        if (!m_cached_etag.empty())
+        {
+            add_etag(m_cached_etag.c_str());
+        }
+    }
+
+    return add_blank_line();
 }
 
 bool http_conn::add_content_length(int content_len)
@@ -905,9 +934,64 @@ bool http_conn::add_content_type()
     return add_response("Content-Type:%s\r\n", "text/html");
 }
 
+// 根据文件扩展名获取MIME类型
+const char* http_conn::get_mime_type(const char* filename)
+{
+    const char* ext = strrchr(filename, '.');
+    if (!ext)
+        return "application/octet-stream";
+
+    // 常见MIME类型映射
+    if (strcmp(ext, ".html") == 0 || strcmp(ext, ".htm") == 0)
+        return "text/html";
+    else if (strcmp(ext, ".css") == 0)
+        return "text/css";
+    else if (strcmp(ext, ".js") == 0)
+        return "application/javascript";
+    else if (strcmp(ext, ".json") == 0)
+        return "application/json";
+    else if (strcmp(ext, ".xml") == 0)
+        return "application/xml";
+    else if (strcmp(ext, ".jpg") == 0 || strcmp(ext, ".jpeg") == 0)
+        return "image/jpeg";
+    else if (strcmp(ext, ".png") == 0)
+        return "image/png";
+    else if (strcmp(ext, ".gif") == 0)
+        return "image/gif";
+    else if (strcmp(ext, ".svg") == 0)
+        return "image/svg+xml";
+    else if (strcmp(ext, ".ico") == 0)
+        return "image/x-icon";
+    else if (strcmp(ext, ".txt") == 0)
+        return "text/plain";
+    else if (strcmp(ext, ".pdf") == 0)
+        return "application/pdf";
+    else if (strcmp(ext, ".mp4") == 0)
+        return "video/mp4";
+    else if (strcmp(ext, ".mp3") == 0)
+        return "audio/mpeg";
+    else
+        return "application/octet-stream";
+}
+
+// 自动识别Content-Type
+bool http_conn::add_content_type_auto()
+{
+    const char* mime_type = get_mime_type(m_real_file);
+    return add_response("Content-Type:%s\r\n", mime_type);
+}
+
 bool http_conn::add_linger()
 {
-    return add_response("Connection:%s\r\n", (m_linger == true) ? "keep-alive" : "close");
+    if (m_linger)
+    {
+        // Keep-Alive: timeout=30秒, max=1000个请求
+        return add_response("Connection: keep-alive\r\nKeep-Alive: timeout=30, max=1000\r\n");
+    }
+    else
+    {
+        return add_response("Connection: close\r\n");
+    }
 }
 
 bool http_conn::add_blank_line()
@@ -960,6 +1044,26 @@ bool http_conn::process_write(HTTP_CODE ret)
     }
     case FILE_REQUEST:
     {
+        // 检查是否应返回 304 Not Modified
+        if (m_if_none_match && !m_cached_etag.empty() &&
+            strcmp(m_if_none_match, m_cached_etag.c_str()) == 0)
+        {
+            // ETag匹配，返回304
+            add_status_line(304, "Not Modified");
+            // 304响应只需要部分头部
+            add_content_type_auto();
+            add_cache_control("public, max-age=3600");
+            add_etag(m_cached_etag.c_str());
+            add_blank_line();
+
+            m_iv[0].iov_base = m_write_buf;
+            m_iv[0].iov_len = m_write_idx;
+            m_iv_count = 1;
+            bytes_to_send = m_write_idx;
+            return true;
+        }
+
+        // 正常200响应
         add_status_line(200, ok_200_title);
         if (m_file_stat.st_size != 0)
         {

@@ -114,11 +114,13 @@ private:
     bool add_status_line(int status, const char *title);
     bool add_headers(int content_length);
     bool add_content_type();
+    bool add_content_type_auto();  // 自动识别Content-Type
     bool add_content_length(int content_length);
     bool add_linger();
     bool add_blank_line();
     bool add_etag(const char *etag);
     bool add_cache_control(const char *directive);
+    const char* get_mime_type(const char* filename);  // 获取MIME类型
 
 public:
     // 移除静态成员，改为依赖注入
@@ -176,6 +178,9 @@ private:
     // HTTP请求头信息
     char *m_if_none_match;  // If-None-Match (ETag验证)
     char *m_accept_encoding; // Accept-Encoding (压缩支持)
+
+    // 缓存的ETag（用于响应）
+    std::string m_cached_etag;
 };
 
 #endif
