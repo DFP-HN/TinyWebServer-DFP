@@ -17,7 +17,8 @@ SRCS = main.cpp \
        ./log/log.cpp \
        ./CGImysql/sql_connection_pool.cpp \
        ./epoll/epoll_manager.cpp \
-       ./user/user_manager.cpp
+       ./user/user_manager.cpp \
+       ./cache/static_cache.cpp
 
 server: $(SRCS)
 	@echo "Building with refactored files: $(SRCS)"
@@ -35,6 +36,7 @@ server-from-backup:
 		./CGImysql/sql_connection_pool.cpp \
 		./epoll/epoll_manager.cpp \
 		./user/user_manager.cpp \
+		./cache/static_cache.cpp \
 		$(CXXFLAGS) -lpthread -lmysqlclient
 
 clean:

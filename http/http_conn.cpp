@@ -6,6 +6,7 @@
 // 引入新的管理器类
 #include "../epoll/epoll_manager.h"
 #include "../user/user_manager.h"
+#include "../cache/static_cache.h"
 
 //定义http响应的一些状态信息
 const char *ok_200_title = "OK";
@@ -23,7 +24,7 @@ const char *error_500_form = "There was an unusual problem serving the request f
 
 // 构造函数
 http_conn::http_conn()
-    : m_epoll_manager(nullptr), m_user_manager(nullptr)
+    : m_epoll_manager(nullptr), m_user_manager(nullptr), m_static_cache(nullptr)
 {
 }
 
@@ -42,6 +43,12 @@ void http_conn::set_epoll_manager(EpollManager *epoll_mgr)
 void http_conn::set_user_manager(UserManager *user_mgr)
 {
     m_user_manager = user_mgr;
+}
+
+// 依赖注入：设置 StaticCache
+void http_conn::set_static_cache(StaticCache *cache)
+{
+    m_static_cache = cache;
 }
 
 void http_conn::initmysql_result(connection_pool *connPool)
@@ -176,6 +183,11 @@ void http_conn::init()
     // 零拷贝优化初始化
     m_file_fd = -1;
     m_use_sendfile = false;
+    m_use_cache = false;
+
+    // HTTP请求头初始化
+    m_if_none_match = nullptr;
+    m_accept_encoding = nullptr;
 
     memset(m_read_buf, '\0', READ_BUFFER_SIZE);
     memset(m_write_buf, '\0', WRITE_BUFFER_SIZE);
@@ -341,6 +353,18 @@ http_conn::HTTP_CODE http_conn::parse_headers(char *text)
         text += 5;
         text += strspn(text, " \t");
         m_host = text;
+    }
+    else if (strncasecmp(text, "If-None-Match:", 14) == 0)
+    {
+        text += 14;
+        text += strspn(text, " \t");
+        m_if_none_match = text;
+    }
+    else if (strncasecmp(text, "Accept-Encoding:", 16) == 0)
+    {
+        text += 16;
+        text += strspn(text, " \t");
+        m_accept_encoding = text;
     }
     else
     {
@@ -593,6 +617,29 @@ http_conn::HTTP_CODE http_conn::do_request()
     if (S_ISDIR(m_file_stat.st_mode))
         return BAD_REQUEST;
 
+    // 静态内容缓存优化：对于GET请求尝试从缓存获取
+    if (m_static_cache && m_method == GET && cgi == 0)
+    {
+        std::shared_ptr<CacheEntry> cached = m_static_cache->get(std::string(m_real_file));
+        if (cached && cached->last_modified == m_file_stat.st_mtime)
+        {
+            // 缓存命中且未过期
+            // 检查ETag（304 Not Modified）
+            if (m_if_none_match && strcmp(m_if_none_match, cached->etag.c_str()) == 0)
+            {
+                // ETag匹配，返回304（这里简化处理，实际应在process_write中处理）
+                // 暂时还是返回FILE_REQUEST，在process_write中检查
+            }
+
+            // 使用缓存内容
+            m_use_cache = true;
+            m_file_address = cached->data.get();
+            m_file_fd = -1;
+            m_use_sendfile = false;
+            return FILE_REQUEST;
+        }
+    }
+
     // 零拷贝优化：保持文件描述符打开，用于 sendfile
     m_file_fd = open(m_real_file, O_RDONLY);
     if (m_file_fd < 0)
@@ -601,6 +648,7 @@ http_conn::HTTP_CODE http_conn::do_request()
     // 根据文件大小决定使用 sendfile 还是 mmap
     // sendfile 对大文件更高效（避免用户空间拷贝）
     const off_t SENDFILE_THRESHOLD = 64 * 1024; // 64KB 阈值
+    const off_t CACHE_THRESHOLD = 512 * 1024;    // 512KB以下才缓存
 
     if (m_file_stat.st_size >= SENDFILE_THRESHOLD)
     {
@@ -619,6 +667,17 @@ http_conn::HTTP_CODE http_conn::do_request()
             m_file_fd = -1;
             return NO_RESOURCE;
         }
+
+        // 加入缓存（仅对小文件且GET请求）
+        if (m_static_cache && m_method == GET && cgi == 0 &&
+            m_file_stat.st_size <= CACHE_THRESHOLD)
+        {
+            m_static_cache->put(std::string(m_real_file),
+                                m_file_address,
+                                m_file_stat.st_size,
+                                m_file_stat.st_mtime);
+        }
+
         // 小文件可以关闭 fd，mmap 已经建立映射
         close(m_file_fd);
         m_file_fd = -1;
@@ -629,8 +688,8 @@ http_conn::HTTP_CODE http_conn::do_request()
 
 void http_conn::unmap()
 {
-    // 清理 mmap 映射
-    if (m_file_address)
+    // 清理 mmap 映射（仅当不使用缓存时）
+    if (m_file_address && !m_use_cache)
     {
         munmap(m_file_address, m_file_stat.st_size);
         m_file_address = 0;
@@ -644,6 +703,7 @@ void http_conn::unmap()
     }
 
     m_use_sendfile = false;
+    m_use_cache = false;
 }
 
 bool http_conn::write()
@@ -858,6 +918,16 @@ bool http_conn::add_blank_line()
 bool http_conn::add_content(const char *content)
 {
     return add_response("%s", content);
+}
+
+bool http_conn::add_etag(const char *etag)
+{
+    return add_response("ETag:%s\r\n", etag);
+}
+
+bool http_conn::add_cache_control(const char *directive)
+{
+    return add_response("Cache-Control:%s\r\n", directive);
 }
 
 bool http_conn::process_write(HTTP_CODE ret)

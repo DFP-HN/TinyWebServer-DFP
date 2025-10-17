@@ -30,6 +30,7 @@
 // 前向声明
 class EpollManager;
 class UserManager;
+class StaticCache;
 
 class http_conn
 {
@@ -81,6 +82,7 @@ public:
     // 注入依赖：EpollManager 和 UserManager
     void set_epoll_manager(EpollManager *epoll_mgr);
     void set_user_manager(UserManager *user_mgr);
+    void set_static_cache(StaticCache *cache);
 
     void init(int sockfd, const sockaddr_in &addr, char *, int, int, string user, string passwd, string sqlname);
     void close_conn(bool real_close = true);
@@ -115,6 +117,8 @@ private:
     bool add_content_length(int content_length);
     bool add_linger();
     bool add_blank_line();
+    bool add_etag(const char *etag);
+    bool add_cache_control(const char *directive);
 
 public:
     // 移除静态成员，改为依赖注入
@@ -153,6 +157,7 @@ private:
     // 零拷贝优化：使用 sendfile 发送静态文件
     int m_file_fd;      // 文件描述符（用于 sendfile）
     bool m_use_sendfile; // 是否使用 sendfile 优化
+    bool m_use_cache;    // 是否使用缓存内容
     char *doc_root;
 
     map<string, string> m_users;
@@ -166,6 +171,11 @@ private:
     // 依赖注入的成员
     EpollManager *m_epoll_manager;
     UserManager *m_user_manager;
+    StaticCache *m_static_cache;
+
+    // HTTP请求头信息
+    char *m_if_none_match;  // If-None-Match (ETag验证)
+    char *m_accept_encoding; // Accept-Encoding (压缩支持)
 };
 
 #endif

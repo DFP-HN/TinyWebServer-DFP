@@ -18,6 +18,7 @@
 #include "./epoll/epoll_manager.h"
 #include "./user/user_manager.h"
 #include "./timer/lst_timer.h"
+#include "./cache/static_cache.h"
 
 const int MAX_FD = 65536;           //最大文件描述符
 const int MAX_EVENT_NUMBER = 10000; //最大事件数
@@ -87,6 +88,7 @@ public:
     // 依赖注入的管理器（使用智能指针）
     std::unique_ptr<EpollManager> m_epoll_manager;  // epoll操作管理器
     std::unique_ptr<UserManager> m_user_manager;    // 用户管理器
+    std::unique_ptr<StaticCache> m_static_cache;    // 静态文件缓存
 };
 
 #endif

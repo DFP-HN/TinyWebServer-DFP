@@ -6,6 +6,7 @@ WebServer::WebServer()
     // 创建管理器实例（使用 make_unique 智能指针）
     m_epoll_manager = std::make_unique<EpollManager>();
     m_user_manager = std::make_unique<UserManager>();
+    m_static_cache = std::make_unique<StaticCache>(256);  // 256MB缓存
 
     // 创建 http_conn 对象数组（使用智能指针）
     users = std::make_unique<http_conn[]>(MAX_FD);
@@ -15,6 +16,7 @@ WebServer::WebServer()
     {
         users[i].set_epoll_manager(m_epoll_manager.get());
         users[i].set_user_manager(m_user_manager.get());
+        users[i].set_static_cache(m_static_cache.get());
     }
 
     // root文件夹路径（使用智能指针）
