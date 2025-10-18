@@ -40,14 +40,15 @@ void connection_pool::init(string url, string User, string PassWord, string DBNa
 
 		if (con == NULL)
 		{
-			LOG_ERROR("MySQL Error");
+			LOG_ERROR("MySQL init Error: %s", mysql_error(con));
 			exit(1);
 		}
 		con = mysql_real_connect(con, url.c_str(), User.c_str(), PassWord.c_str(), DBName.c_str(), Port, NULL, 0);
 
 		if (con == NULL)
 		{
-			LOG_ERROR("MySQL Error");
+			LOG_ERROR("MySQL connection Error: %s (host=%s, user=%s, db=%s, port=%d)",
+				mysql_error(con), url.c_str(), User.c_str(), DBName.c_str(), Port);
 			exit(1);
 		}
 		connList.push_back(con);

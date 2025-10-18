@@ -27,6 +27,28 @@ Linux下C++轻量级Web服务器，助力初学者快速实践网络编程，搭
 | [概述](#概述) | [框架](#框架) | [Demo演示](#Demo演示) | [压力测试](#压力测试) |[更新日志](#更新日志) |[源码下载](#源码下载) | [快速运行](#快速运行) | [个性化运行](#个性化运行) | [庖丁解牛](#庖丁解牛) | [CPP11实现](#CPP11实现) |[致谢](#致谢) |
 |:--------:|:--------:|:--------:|:--------:|:--------:|:--------:|:--------:|:--------:|:--------:|:--------:|:--------:|
 
+📚 文档导航
+-----------
+
+**所有项目文档已分类整理，请访问 [docs/](./docs/) 目录查看完整文档索引。**
+
+### 快速链接
+
+| 分类 | 说明 | 入口文档 |
+|------|------|---------|
+| 🚀 **快速开始** | 新手部署和使用指南 | [docs/getting-started/](./docs/getting-started/) |
+| 🔧 **重构文档** | 架构重构设计和实施 | [docs/refactoring/](./docs/refactoring/) |
+| ⚡ **性能优化** | 各项性能优化详解 | [docs/optimization/](./docs/optimization/) |
+| 🔄 **工作窃取** | 工作窃取线程池Bug修复 | [docs/work-stealing/](./docs/work-stealing/) |
+
+### 推荐入口
+
+- **我是新手**: [docs/getting-started/QUICK_START_WSL2.md](./docs/getting-started/QUICK_START_WSL2.md)
+- **了解架构**: [CLAUDE.md](./CLAUDE.md) - 项目架构和设计说明
+- **提升性能**: [docs/optimization/](./docs/optimization/)
+- **完整索引**: [docs/README.md](./docs/README.md)
+
+---
 
 概述
 ----------

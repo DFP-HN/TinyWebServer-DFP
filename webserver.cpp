@@ -124,7 +124,8 @@ void WebServer::sql_pool()
 void WebServer::thread_pool()
 {
     //线程池（使用智能指针）
-    m_pool = std::make_unique<threadpool<http_conn>>(m_actormodel, m_connPool, m_thread_num);
+    //m_pool = std::make_unique<threadpool<http_conn>>(m_actormodel, m_connPool, m_thread_num);
+    m_pool = std::make_unique<WorkStealingPool<http_conn>>(m_actormodel, m_connPool, m_thread_num);
 }
 
 void WebServer::eventListen()

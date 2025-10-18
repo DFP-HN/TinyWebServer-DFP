@@ -1,5 +1,8 @@
 CXX ?= g++
 
+# C++17 标准（工作窃取线程池需要 std::optional）
+CXXFLAGS += -std=c++17
+
 DEBUG ?= 1
 ifeq ($(DEBUG), 1)
     CXXFLAGS += -g
@@ -18,7 +21,8 @@ SRCS = main.cpp \
        ./CGImysql/sql_connection_pool.cpp \
        ./epoll/epoll_manager.cpp \
        ./user/user_manager.cpp \
-       ./cache/static_cache.cpp
+       ./cache/static_cache.cpp \
+       ./threadpool/work_stealing_pool.cpp
 
 server: $(SRCS)
 	@echo "Building with refactored files: $(SRCS)"
@@ -28,7 +32,7 @@ server: $(SRCS)
 # 注意：现在直接使用重构后的文件，不再从备份复制
 server-from-backup:
 	@echo "Building from refactored files (no backup needed)..."
-	$(CXX) -o server main.cpp config.cpp \
+	$(CXX) $(CXXFLAGS) -o server main.cpp config.cpp \
 		webserver.cpp \
 		http/http_conn.cpp \
 		./timer/lst_timer.cpp \
@@ -37,7 +41,8 @@ server-from-backup:
 		./epoll/epoll_manager.cpp \
 		./user/user_manager.cpp \
 		./cache/static_cache.cpp \
-		$(CXXFLAGS) -lpthread -lmysqlclient
+		./threadpool/work_stealing_pool.cpp \
+		-lpthread -lmysqlclient
 
 clean:
 	rm -f server

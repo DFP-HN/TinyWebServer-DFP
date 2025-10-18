@@ -13,7 +13,8 @@
 #include <sys/epoll.h>
 #include <memory>  // 智能指针
 
-#include "./threadpool/threadpool.h"
+//#include "./threadpool/threadpool.h"  // 原线程池
+#include "./threadpool/work_stealing_pool.h"  // 工作窃取线程池
 #include "./http/http_conn.h"
 #include "./epoll/epoll_manager.h"
 #include "./user/user_manager.h"
@@ -70,7 +71,8 @@ public:
     int m_sql_num;
 
     //线程池相关
-    std::unique_ptr<threadpool<http_conn>> m_pool;  // 智能指针管理
+    //std::unique_ptr<threadpool<http_conn>> m_pool;  // 原线程池（智能指针管理）
+    std::unique_ptr<WorkStealingPool<http_conn>> m_pool;  // 工作窃取线程池（智能指针管理）
     int m_thread_num;
 
     //epoll_event相关
