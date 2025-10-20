@@ -30,11 +30,14 @@ Config::Config(){
 
     //并发模型,默认是proactor
     actor_model = 0;
+
+    //事件循环模式，默认是epoll
+    event_loop_mode = 0;  // 0=epoll, 1=io_uring
 }
 
 void Config::parse_arg(int argc, char*argv[]){
     int opt;
-    const char *str = "p:l:m:o:s:t:c:a:";
+    const char *str = "p:l:m:o:s:t:c:a:e:";
     while ((opt = getopt(argc, argv, str)) != -1)
     {
         switch (opt)
@@ -77,6 +80,11 @@ void Config::parse_arg(int argc, char*argv[]){
         case 'a':
         {
             actor_model = atoi(optarg);
+            break;
+        }
+        case 'e':
+        {
+            event_loop_mode = atoi(optarg);
             break;
         }
         default:

@@ -42,6 +42,9 @@ public:
 
     //并发模型选择
     int actor_model;
+
+    //事件循环模式（0=epoll, 1=io_uring）
+    int event_loop_mode;
 };
 
 #endif

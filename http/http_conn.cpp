@@ -1,4 +1,5 @@
 #include "http_conn.h"
+#include "zero_copy.h"  // 零拷贝管理器
 
 #include <mysql/mysql.h>
 #include <fstream>
@@ -648,24 +649,32 @@ http_conn::HTTP_CODE http_conn::do_request()
     if (m_file_fd < 0)
         return NO_RESOURCE;
 
-    // 根据文件大小决定使用 sendfile 还是 mmap
-    // sendfile 对大文件更高效（避免用户空间拷贝）
-    const off_t SENDFILE_THRESHOLD = 64 * 1024; // 64KB 阈值
+    // 使用 ZeroCopyManager 智能选择传输方式
+    // 1. 小文件 (< 64KB): 使用 mmap + 缓存
+    // 2. 中等文件 (64KB - 4MB): 使用 sendfile 零拷贝
+    // 3. 大文件 (> 4MB): 使用 sendfile 零拷贝
+    bool is_cached = false;  // 文件内容未缓存（已从缓存读取的在上面处理了）
+    ZeroCopyManager::TransferMethod method = ZeroCopyManager::choose_method(
+        m_file_stat.st_size, is_cached
+    );
+
     const off_t CACHE_THRESHOLD = 512 * 1024;    // 512KB以下才缓存
 
-    if (m_file_stat.st_size >= SENDFILE_THRESHOLD)
+    if (method == ZeroCopyManager::USE_SENDFILE)
     {
-        // 使用 sendfile 零拷贝优化（大文件）
+        // 使用 sendfile 零拷贝优化（中大文件：64KB ~ 无限制）
         m_use_sendfile = true;
         m_file_address = NULL; // 不需要 mmap
+        LOG_DEBUG("File %s (size=%ld) will use sendfile", m_real_file, m_file_stat.st_size);
     }
-    else
+    else  // USE_CACHE 或 USE_MMAP
     {
-        // 使用传统 mmap 方式（小文件，mmap 开销可接受）
+        // 使用 mmap 方式（小文件 < 64KB）
         m_use_sendfile = false;
         m_file_address = (char *)mmap(0, m_file_stat.st_size, PROT_READ, MAP_PRIVATE, m_file_fd, 0);
         if (m_file_address == MAP_FAILED)
         {
+            LOG_ERROR("mmap failed for %s: %s", m_real_file, strerror(errno));
             close(m_file_fd);
             m_file_fd = -1;
             return NO_RESOURCE;
@@ -691,6 +700,7 @@ http_conn::HTTP_CODE http_conn::do_request()
         // 小文件可以关闭 fd，mmap 已经建立映射
         close(m_file_fd);
         m_file_fd = -1;
+        LOG_DEBUG("File %s (size=%ld) will use mmap", m_real_file, m_file_stat.st_size);
     }
 
     return FILE_REQUEST;

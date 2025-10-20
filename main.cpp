@@ -14,10 +14,10 @@ int main(int argc, char *argv[])
     WebServer server;
 
     //初始化
-    server.init(config.PORT, user, passwd, databasename, config.LOGWrite, 
-                config.OPT_LINGER, config.TRIGMode,  config.sql_num,  config.thread_num, 
-                config.close_log, config.actor_model);
-    
+    server.init(config.PORT, user, passwd, databasename, config.LOGWrite,
+                config.OPT_LINGER, config.TRIGMode,  config.sql_num,  config.thread_num,
+                config.close_log, config.actor_model, config.event_loop_mode);
+
 
     //日志
     server.log_write();
@@ -34,8 +34,19 @@ int main(int argc, char *argv[])
     //监听
     server.eventListen();
 
-    //运行
-    server.eventLoop();
+    //根据配置选择事件循环模式
+#ifdef USE_IO_URING
+    if (config.event_loop_mode == IO_URING_MODE)
+    {
+        LOG_INFO("Using io_uring event loop");
+        server.eventLoop_uring();
+    }
+    else
+#endif
+    {
+        LOG_INFO("Using epoll event loop");
+        server.eventLoop();
+    }
 
     return 0;
 }

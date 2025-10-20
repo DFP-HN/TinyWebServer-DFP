@@ -97,6 +97,11 @@ public:
     int timer_flag;
     int improv;
 
+    // 公共访问器（用于 io_uring 事件循环）
+    char* get_read_buffer() { return m_read_buf; }
+    long& get_read_idx() { return m_read_idx; }
+    void reset_connection() { init(); }
+
 
 private:
     void init();

@@ -8,6 +8,11 @@ WebServer::WebServer()
     m_user_manager = std::make_unique<UserManager>();
     m_static_cache = std::make_unique<StaticCache>(256);  // 256MB缓存
 
+#ifdef USE_IO_URING
+    // 创建 io_uring 管理器（队列深度 256）
+    m_io_uring_manager = std::make_unique<IoUringManager>(256);
+#endif
+
     // 创建 http_conn 对象数组（使用智能指针）
     users = std::make_unique<http_conn[]>(MAX_FD);
 
@@ -43,7 +48,7 @@ WebServer::~WebServer()
 }
 
 void WebServer::init(int port, string user, string passWord, string databaseName, int log_write,
-                     int opt_linger, int trigmode, int sql_num, int thread_num, int close_log, int actor_model)
+                     int opt_linger, int trigmode, int sql_num, int thread_num, int close_log, int actor_model, int event_loop_mode)
 {
     m_port = port;
     m_user = user;
@@ -56,6 +61,30 @@ void WebServer::init(int port, string user, string passWord, string databaseName
     m_TRIGMode = trigmode;
     m_close_log = close_log;
     m_actormodel = actor_model;
+    m_event_loop_mode = event_loop_mode;
+
+#ifdef USE_IO_URING
+    // 如果使用 io_uring 模式，初始化 io_uring 管理器
+    if (m_event_loop_mode == IO_URING_MODE && m_io_uring_manager)
+    {
+        if (!m_io_uring_manager->init())
+        {
+            LOG_ERROR("Failed to initialize io_uring, falling back to epoll mode");
+            m_event_loop_mode = EPOLL_MODE;
+        }
+        else
+        {
+            LOG_INFO("io_uring initialized successfully");
+        }
+    }
+#else
+    // 如果没有编译 io_uring 支持，强制使用 epoll 模式
+    if (m_event_loop_mode == IO_URING_MODE)
+    {
+        LOG_WARN("io_uring not compiled, falling back to epoll mode");
+        m_event_loop_mode = EPOLL_MODE;
+    }
+#endif
 }
 
 void WebServer::trig_mode()
@@ -124,8 +153,8 @@ void WebServer::sql_pool()
 void WebServer::thread_pool()
 {
     //线程池（使用智能指针）
-    //m_pool = std::make_unique<threadpool<http_conn>>(m_actormodel, m_connPool, m_thread_num);
-    m_pool = std::make_unique<WorkStealingPool<http_conn>>(m_actormodel, m_connPool, m_thread_num);
+    m_pool = std::make_unique<threadpool<http_conn>>(m_actormodel, m_connPool, m_thread_num);
+    // m_pool = std::make_unique<WorkStealingPool<http_conn>>(m_actormodel, m_connPool, m_thread_num);
 }
 
 void WebServer::eventListen()
@@ -471,3 +500,193 @@ void WebServer::eventLoop()
         }
     }
 }
+
+#ifdef USE_IO_URING
+// io_uring 事件循环
+void WebServer::eventLoop_uring()
+{
+    if (!m_io_uring_manager || !m_io_uring_manager->is_initialized())
+    {
+        LOG_ERROR("io_uring not initialized, cannot start event loop");
+        return;
+    }
+
+    LOG_INFO("Starting io_uring event loop (queue depth=%u)", m_io_uring_manager->get_queue_depth());
+
+    bool timeout = false;
+    bool stop_server = false;
+
+    // 提交监听 socket 的 accept 请求（异步接受连接）
+    struct sockaddr_in client_address;
+    socklen_t client_addrlength = sizeof(client_address);
+    m_io_uring_manager->submit_accept(m_listenfd, (struct sockaddr*)&client_address,
+                                       &client_addrlength, (uint64_t)m_listenfd);
+
+    while (!stop_server)
+    {
+        // 批量提交所有待处理的 SQ 条目
+        int submitted = m_io_uring_manager->submit_all();
+        if (submitted < 0)
+        {
+            LOG_ERROR("io_uring_submit failed");
+            break;
+        }
+
+        // 等待至少一个完成事件
+        int ready = m_io_uring_manager->wait_completions(1);
+        if (ready < 0)
+        {
+            if (errno == EINTR)
+            {
+                // 被信号中断，检查定时器
+                if (timeout)
+                {
+                    utils.timer_handler();
+                    LOG_INFO("%s", "timer tick");
+                    timeout = false;
+                }
+                continue;
+            }
+            LOG_ERROR("io_uring_wait_completions failed");
+            break;
+        }
+
+        // 处理所有完成事件
+        int processed = m_io_uring_manager->process_completions([this, &timeout, &stop_server,
+                                                                  &client_address, &client_addrlength]
+                                                                 (struct io_uring_cqe *cqe) {
+            handle_io_completion(cqe);
+
+            // 如果是 accept 完成，重新提交 accept 请求（持续监听）
+            uint64_t user_data = (uint64_t)io_uring_cqe_get_data(cqe);
+            if (user_data == (uint64_t)m_listenfd && cqe->res > 0)
+            {
+                // accept 成功，重新提交 accept 请求
+                m_io_uring_manager->submit_accept(m_listenfd, (struct sockaddr*)&client_address,
+                                                   &client_addrlength, (uint64_t)m_listenfd);
+            }
+        });
+
+        if (processed < 0)
+        {
+            LOG_ERROR("process_completions failed");
+            break;
+        }
+
+        // 处理定时器
+        if (timeout)
+        {
+            utils.timer_handler();
+            LOG_INFO("%s", "timer tick");
+            timeout = false;
+        }
+    }
+
+    LOG_INFO("io_uring event loop stopped");
+}
+
+// 处理 io_uring 完成事件
+void WebServer::handle_io_completion(struct io_uring_cqe *cqe)
+{
+    if (!cqe)
+    {
+        return;
+    }
+
+    uint64_t user_data = (uint64_t)io_uring_cqe_get_data(cqe);
+    int res = cqe->res;
+
+    // user_data 编码：
+    // - 如果等于 m_listenfd，表示 accept 操作
+    // - 否则表示连接的 socket fd
+
+    if (user_data == (uint64_t)m_listenfd)
+    {
+        // accept 操作完成
+        if (res < 0)
+        {
+            LOG_ERROR("async accept failed: %s", strerror(-res));
+            return;
+        }
+
+        int connfd = res;
+        LOG_DEBUG("async accept: new connection fd=%d", connfd);
+
+        // 设置连接（这里可以复用 dealclientdata 的逻辑）
+        struct sockaddr_in client_address;
+        socklen_t client_addrlength = sizeof(client_address);
+        getpeername(connfd, (struct sockaddr*)&client_address, &client_addrlength);
+
+        // 初始化连接
+        timer(connfd, client_address);
+
+        // 提交异步读请求
+        m_io_uring_manager->submit_read(connfd, users[connfd].get_read_buffer(),
+                                         http_conn::READ_BUFFER_SIZE, -1, (uint64_t)connfd);
+    }
+    else
+    {
+        // 普通连接的 I/O 操作完成
+        int sockfd = (int)user_data;
+
+        if (sockfd < 0 || sockfd >= MAX_FD)
+        {
+            LOG_ERROR("Invalid sockfd=%d from io_uring completion", sockfd);
+            return;
+        }
+
+        if (res < 0)
+        {
+            // I/O 错误，关闭连接
+            LOG_DEBUG("I/O error on fd=%d: %s", sockfd, strerror(-res));
+            auto timer = users_timer[sockfd].timer;
+            deal_timer(timer, sockfd);
+            return;
+        }
+
+        if (res == 0)
+        {
+            // 连接关闭
+            LOG_DEBUG("Connection closed: fd=%d", sockfd);
+            auto timer = users_timer[sockfd].timer;
+            deal_timer(timer, sockfd);
+            return;
+        }
+
+        // I/O 成功，更新连接状态
+        http_conn *conn = &users[sockfd];
+
+        // 根据当前状态判断是读完成还是写完成
+        if (conn->m_state == 0)
+        {
+            // 读操作完成
+            conn->get_read_idx() += res;
+            LOG_DEBUG("async read completed: fd=%d, bytes=%d", sockfd, res);
+
+            // 处理请求（交给线程池）
+            if (m_actormodel == 1)
+            {
+                // Reactor 模式：线程池处理读取和业务逻辑
+                m_pool->append(conn, 0);
+            }
+            else
+            {
+                // Proactor 模式：主线程已读取，线程池只处理业务逻辑
+                m_pool->append_p(conn);
+            }
+        }
+        else
+        {
+            // 写操作完成
+            LOG_DEBUG("async write completed: fd=%d, bytes=%d", sockfd, res);
+
+            // 重置连接状态，准备下一次读取
+            conn->reset_connection();
+            m_io_uring_manager->submit_read(sockfd, conn->get_read_buffer(),
+                                             http_conn::READ_BUFFER_SIZE, -1, (uint64_t)sockfd);
+        }
+    }
+}
+
+#endif // USE_IO_URING
+
