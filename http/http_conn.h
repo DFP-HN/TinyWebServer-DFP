@@ -102,6 +102,30 @@ public:
     long& get_read_idx() { return m_read_idx; }
     void reset_connection() { init(); }
 
+    // io_uring 写操作访问器
+    int get_bytes_to_send() const { return bytes_to_send; }
+    int get_bytes_have_send() const { return bytes_have_send; }
+    void add_bytes_have_send(int bytes) { bytes_have_send += bytes; }
+    struct iovec* get_iovec() { return m_iv; }
+    int get_iovec_count() const { return m_iv_count; }
+    bool get_linger() const { return m_linger; }
+
+    // sendfile 相关访问器
+    bool is_using_sendfile() const { return m_use_sendfile; }
+    int get_file_fd() const { return m_file_fd; }
+    off_t get_file_size() const { return m_file_stat.st_size; }
+    int get_write_idx() const { return m_write_idx; }
+
+    // io_uring 文件缓冲区管理
+    void set_file_buffer(char *buffer) { m_file_buffer = buffer; }
+    char* get_file_buffer() { return m_file_buffer; }
+    void clear_file_buffer() {
+        if (m_file_buffer) {
+            delete[] m_file_buffer;
+            m_file_buffer = nullptr;
+        }
+    }
+
 
 private:
     void init();
@@ -166,6 +190,9 @@ private:
     bool m_use_sendfile; // 是否使用 sendfile 优化
     bool m_use_cache;    // 是否使用缓存内容
     char *doc_root;
+
+    // io_uring 模式下文件传输的临时缓冲区
+    char *m_file_buffer;  // 临时缓冲区（用于 io_uring + sendfile）
 
     map<string, string> m_users;
     int m_TRIGMode;

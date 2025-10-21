@@ -32,7 +32,7 @@ Config::Config(){
     actor_model = 0;
 
     //事件循环模式，默认是epoll
-    event_loop_mode = 0;  // 0=epoll, 1=io_uring
+    event_loop_mode = 1;  // 0=epoll, 1=io_uring
 }
 
 void Config::parse_arg(int argc, char*argv[]){

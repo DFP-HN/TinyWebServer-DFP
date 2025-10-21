@@ -22,9 +22,9 @@
 #include "./cache/static_cache.h"
 #include "./log/log.h"
 
-#ifdef USE_IO_URING
+// #ifdef USE_IO_URING
 #include "./io_uring/io_uring_manager.h"
-#endif
+// #endif
 
 const int MAX_FD = 65536;           //最大文件描述符
 const int MAX_EVENT_NUMBER = 10000; //最大事件数
@@ -55,10 +55,10 @@ public:
     void eventListen();
     void eventLoop();
 
-#ifdef USE_IO_URING
+// #ifdef USE_IO_URING
     // io_uring 事件循环
     void eventLoop_uring();
-#endif
+// #endif
 
     void timer(int connfd, struct sockaddr_in client_address);
     void adjust_timer(std::shared_ptr<util_timer> timer);
@@ -68,13 +68,13 @@ public:
     void dealwithread(int sockfd);
     void dealwithwrite(int sockfd);
 
-#ifdef USE_IO_URING
+// #ifdef USE_IO_URING
     // io_uring 专用方法
     void dealclientdata_uring();
     void dealwithread_uring(int sockfd);
     void dealwithwrite_uring(int sockfd);
     void handle_io_completion(struct io_uring_cqe *cqe);
-#endif
+//#endif
 
 public:
     //基础
@@ -119,9 +119,9 @@ public:
     std::unique_ptr<StaticCache> m_static_cache;    // 静态文件缓存
     std::unique_ptr<Log> m_logger;                  // 日志系统
 
-#ifdef USE_IO_URING
+// #ifdef USE_IO_URING
     std::unique_ptr<IoUringManager> m_io_uring_manager;  // io_uring 管理器
-#endif
+// #endif
 };
 
 #endif

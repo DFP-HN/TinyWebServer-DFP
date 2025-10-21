@@ -25,13 +25,15 @@ const char *error_500_form = "There was an unusual problem serving the request f
 
 // 构造函数
 http_conn::http_conn()
-    : m_epoll_manager(nullptr), m_user_manager(nullptr), m_static_cache(nullptr)
+    : m_epoll_manager(nullptr), m_user_manager(nullptr), m_static_cache(nullptr),
+      m_file_buffer(nullptr)
 {
 }
 
 // 析构函数
 http_conn::~http_conn()
 {
+    clear_file_buffer();
 }
 
 // 依赖注入：设置 EpollManager

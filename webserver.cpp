@@ -8,10 +8,10 @@ WebServer::WebServer()
     m_user_manager = std::make_unique<UserManager>();
     m_static_cache = std::make_unique<StaticCache>(256);  // 256MB缓存
 
-#ifdef USE_IO_URING
+// #ifdef USE_IO_URING
     // 创建 io_uring 管理器（队列深度 256）
     m_io_uring_manager = std::make_unique<IoUringManager>(256);
-#endif
+// #endif
 
     // 创建 http_conn 对象数组（使用智能指针）
     users = std::make_unique<http_conn[]>(MAX_FD);
@@ -502,6 +502,15 @@ void WebServer::eventLoop()
 }
 
 #ifdef USE_IO_URING
+// io_uring user_data 编码：高32位=操作类型，低32位=fd
+// 操作类型：0=accept, 1=read, 2=write
+#define OP_ACCEPT 0ULL
+#define OP_READ   1ULL
+#define OP_WRITE  2ULL
+#define ENCODE_USER_DATA(op, fd) (((uint64_t)(op) << 32) | (uint64_t)(fd))
+#define DECODE_OP(user_data) ((user_data) >> 32)
+#define DECODE_FD(user_data) ((int)((user_data) & 0xFFFFFFFF))
+
 // io_uring 事件循环
 void WebServer::eventLoop_uring()
 {
@@ -516,11 +525,14 @@ void WebServer::eventLoop_uring()
     bool timeout = false;
     bool stop_server = false;
 
+    // 为 accept 分配独立的地址结构（避免被覆盖）
+    struct sockaddr_in *accept_addr = new struct sockaddr_in;
+    socklen_t *accept_addrlen = new socklen_t;
+    *accept_addrlen = sizeof(struct sockaddr_in);
+
     // 提交监听 socket 的 accept 请求（异步接受连接）
-    struct sockaddr_in client_address;
-    socklen_t client_addrlength = sizeof(client_address);
-    m_io_uring_manager->submit_accept(m_listenfd, (struct sockaddr*)&client_address,
-                                       &client_addrlength, (uint64_t)m_listenfd);
+    m_io_uring_manager->submit_accept(m_listenfd, (struct sockaddr*)accept_addr,
+                                       accept_addrlen, ENCODE_USER_DATA(OP_ACCEPT, m_listenfd));
 
     while (!stop_server)
     {
@@ -552,18 +564,20 @@ void WebServer::eventLoop_uring()
         }
 
         // 处理所有完成事件
-        int processed = m_io_uring_manager->process_completions([this, &timeout, &stop_server,
-                                                                  &client_address, &client_addrlength]
+        int processed = m_io_uring_manager->process_completions([this, accept_addr, accept_addrlen]
                                                                  (struct io_uring_cqe *cqe) {
             handle_io_completion(cqe);
 
-            // 如果是 accept 完成，重新提交 accept 请求（持续监听）
+            // 如果是 accept 完成且成功，重新提交 accept 请求（持续监听）
             uint64_t user_data = (uint64_t)io_uring_cqe_get_data(cqe);
-            if (user_data == (uint64_t)m_listenfd && cqe->res > 0)
+            uint64_t op_type = DECODE_OP(user_data);
+
+            if (op_type == OP_ACCEPT && cqe->res > 0)
             {
                 // accept 成功，重新提交 accept 请求
-                m_io_uring_manager->submit_accept(m_listenfd, (struct sockaddr*)&client_address,
-                                                   &client_addrlength, (uint64_t)m_listenfd);
+                *accept_addrlen = sizeof(struct sockaddr_in);
+                m_io_uring_manager->submit_accept(m_listenfd, (struct sockaddr*)accept_addr,
+                                                   accept_addrlen, ENCODE_USER_DATA(OP_ACCEPT, m_listenfd));
             }
         });
 
@@ -582,6 +596,10 @@ void WebServer::eventLoop_uring()
         }
     }
 
+    // 清理
+    delete accept_addr;
+    delete accept_addrlen;
+
     LOG_INFO("io_uring event loop stopped");
 }
 
@@ -596,11 +614,11 @@ void WebServer::handle_io_completion(struct io_uring_cqe *cqe)
     uint64_t user_data = (uint64_t)io_uring_cqe_get_data(cqe);
     int res = cqe->res;
 
-    // user_data 编码：
-    // - 如果等于 m_listenfd，表示 accept 操作
-    // - 否则表示连接的 socket fd
+    // 解码操作类型和文件描述符
+    uint64_t op_type = DECODE_OP(user_data);
+    int sockfd = DECODE_FD(user_data);
 
-    if (user_data == (uint64_t)m_listenfd)
+    if (op_type == OP_ACCEPT)
     {
         // accept 操作完成
         if (res < 0)
@@ -610,35 +628,34 @@ void WebServer::handle_io_completion(struct io_uring_cqe *cqe)
         }
 
         int connfd = res;
-        LOG_DEBUG("async accept: new connection fd=%d", connfd);
+        LOG_INFO("async accept: new connection fd=%d", connfd);
 
-        // 设置连接（这里可以复用 dealclientdata 的逻辑）
+        // 获取客户端地址
         struct sockaddr_in client_address;
         socklen_t client_addrlength = sizeof(client_address);
         getpeername(connfd, (struct sockaddr*)&client_address, &client_addrlength);
 
-        // 初始化连接
+        // 初始化连接和定时器
         timer(connfd, client_address);
 
         // 提交异步读请求
         m_io_uring_manager->submit_read(connfd, users[connfd].get_read_buffer(),
-                                         http_conn::READ_BUFFER_SIZE, -1, (uint64_t)connfd);
+                                         http_conn::READ_BUFFER_SIZE, -1,
+                                         ENCODE_USER_DATA(OP_READ, connfd));
     }
-    else
+    else if (op_type == OP_READ)
     {
-        // 普通连接的 I/O 操作完成
-        int sockfd = (int)user_data;
-
+        // 读操作完成
         if (sockfd < 0 || sockfd >= MAX_FD)
         {
-            LOG_ERROR("Invalid sockfd=%d from io_uring completion", sockfd);
+            LOG_ERROR("Invalid sockfd=%d from io_uring read completion", sockfd);
             return;
         }
 
         if (res < 0)
         {
             // I/O 错误，关闭连接
-            LOG_DEBUG("I/O error on fd=%d: %s", sockfd, strerror(-res));
+            LOG_DEBUG("async read error on fd=%d: %s", sockfd, strerror(-res));
             auto timer = users_timer[sockfd].timer;
             deal_timer(timer, sockfd);
             return;
@@ -647,44 +664,190 @@ void WebServer::handle_io_completion(struct io_uring_cqe *cqe)
         if (res == 0)
         {
             // 连接关闭
-            LOG_DEBUG("Connection closed: fd=%d", sockfd);
+            LOG_DEBUG("Connection closed by peer: fd=%d", sockfd);
             auto timer = users_timer[sockfd].timer;
             deal_timer(timer, sockfd);
             return;
         }
 
-        // I/O 成功，更新连接状态
+        // 读取成功
         http_conn *conn = &users[sockfd];
+        conn->get_read_idx() += res;
+        LOG_DEBUG("async read completed: fd=%d, bytes=%d, total=%ld",
+                  sockfd, res, conn->get_read_idx());
 
-        // 根据当前状态判断是读完成还是写完成
-        if (conn->m_state == 0)
+        // 调整定时器
+        auto timer = users_timer[sockfd].timer;
+        if (timer)
         {
-            // 读操作完成
-            conn->get_read_idx() += res;
-            LOG_DEBUG("async read completed: fd=%d, bytes=%d", sockfd, res);
+            adjust_timer(timer);
+        }
 
-            // 处理请求（交给线程池）
-            if (m_actormodel == 1)
+        // io_uring 模式下，在主线程中处理 HTTP（避免线程池开销）
+        // 因为 io_uring 本身就是异步的，不需要再用线程池
+        conn->process();
+
+        // 检查是否有响应需要发送
+        if (conn->get_bytes_to_send() > 0)
+        {
+            // 提交异步写请求
+            struct iovec *iv = conn->get_iovec();
+            int iv_count = conn->get_iovec_count();
+
+            // 先发送响应头（第一块数据）
+            if (iv_count > 0 && iv[0].iov_len > 0)
             {
-                // Reactor 模式：线程池处理读取和业务逻辑
-                m_pool->append(conn, 0);
+                m_io_uring_manager->submit_write(sockfd, iv[0].iov_base, iv[0].iov_len, -1,
+                                                  ENCODE_USER_DATA(OP_WRITE, sockfd));
+            }
+            // 注意：文件内容会在写完成后发送
+        }
+        else
+        {
+            // 没有数据要发送，继续读取
+            conn->reset_connection();
+            m_io_uring_manager->submit_read(sockfd, conn->get_read_buffer(),
+                                             http_conn::READ_BUFFER_SIZE, -1,
+                                             ENCODE_USER_DATA(OP_READ, sockfd));
+        }
+    }
+    else if (op_type == OP_WRITE)
+    {
+        // 写操作完成
+        if (sockfd < 0 || sockfd >= MAX_FD)
+        {
+            LOG_ERROR("Invalid sockfd=%d from io_uring write completion", sockfd);
+            return;
+        }
+
+        if (res < 0)
+        {
+            // I/O 错误，关闭连接
+            LOG_DEBUG("async write error on fd=%d: %s", sockfd, strerror(-res));
+            auto timer = users_timer[sockfd].timer;
+            deal_timer(timer, sockfd);
+            return;
+        }
+
+        // 写入成功
+        http_conn *conn = &users[sockfd];
+        LOG_DEBUG("async write completed: fd=%d, bytes=%d", sockfd, res);
+
+        // 更新已发送的字节数
+        conn->add_bytes_have_send(res);
+
+        // 获取当前状态
+        int bytes_sent = conn->get_bytes_have_send();
+        int bytes_total = conn->get_bytes_to_send();
+        int write_idx = conn->get_write_idx();
+
+        LOG_DEBUG("Write state: fd=%d, sent=%d, total=%d, write_idx=%d, using_sendfile=%d",
+                  sockfd, bytes_sent, bytes_total, write_idx, conn->is_using_sendfile());
+
+        // 检查是否还有数据要发送
+        if (bytes_sent < bytes_total)
+        {
+            // 判断响应头是否已经发送完成
+            if (bytes_sent >= write_idx)
+            {
+                // 响应头已发送完成，现在需要发送文件内容
+                if (conn->is_using_sendfile())
+                {
+                    // io_uring 的 splice 操作可能不支持文件->socket直接传输
+                    // 改用 read + write 方案：分配缓冲区，读取文件内容，然后发送
+
+                    int file_fd = conn->get_file_fd();
+                    off_t file_offset = bytes_sent - write_idx;
+                    size_t file_size = conn->get_file_size();
+                    size_t file_remaining = file_size - file_offset;
+
+                    LOG_DEBUG("Sending file content: fd=%d, file_fd=%d, offset=%ld, remaining=%zu",
+                              sockfd, file_fd, file_offset, file_remaining);
+
+                    // 使用 pread 读取文件内容到缓冲区，然后用 io_uring write
+                    // 为了避免内存分配，我们一次最多发送 128KB
+                    const size_t CHUNK_SIZE = 128 * 1024;
+                    size_t send_size = (file_remaining > CHUNK_SIZE) ? CHUNK_SIZE : file_remaining;
+
+                    // 分配临时缓冲区（存储在 http_conn 中，在下次写完成或连接关闭时释放）
+                    conn->clear_file_buffer();  // 清理旧缓冲区
+                    char *file_buffer = new char[send_size];
+                    conn->set_file_buffer(file_buffer);
+
+                    ssize_t read_bytes = pread(file_fd, file_buffer, send_size, file_offset);
+
+                    if (read_bytes > 0)
+                    {
+                        m_io_uring_manager->submit_write(sockfd, file_buffer, read_bytes, -1,
+                                                          ENCODE_USER_DATA(OP_WRITE, sockfd));
+                    }
+                    else
+                    {
+                        LOG_ERROR("pread failed for fd=%d: %s", file_fd, strerror(errno));
+                        conn->clear_file_buffer();
+                        auto timer = users_timer[sockfd].timer;
+                        deal_timer(timer, sockfd);
+                    }
+                }
+                else
+                {
+                    // 使用 mmap 方式，发送第二块数据（文件内容）
+                    struct iovec *iv = conn->get_iovec();
+                    int iv_count = conn->get_iovec_count();
+
+                    if (iv_count > 1 && iv[1].iov_len > 0)
+                    {
+                        // 计算已经发送的文件内容偏移
+                        size_t file_sent = bytes_sent - write_idx;
+                        char *file_base = (char*)iv[1].iov_base + file_sent;
+                        size_t file_remaining = iv[1].iov_len - file_sent;
+
+                        m_io_uring_manager->submit_write(sockfd, file_base, file_remaining, -1,
+                                                          ENCODE_USER_DATA(OP_WRITE, sockfd));
+                    }
+                }
             }
             else
             {
-                // Proactor 模式：主线程已读取，线程池只处理业务逻辑
-                m_pool->append_p(conn);
+                // 响应头还没发送完，继续发送响应头
+                struct iovec *iv = conn->get_iovec();
+                char *header_base = (char*)iv[0].iov_base + bytes_sent;
+                size_t header_remaining = write_idx - bytes_sent;
+
+                m_io_uring_manager->submit_write(sockfd, header_base, header_remaining, -1,
+                                                  ENCODE_USER_DATA(OP_WRITE, sockfd));
             }
         }
         else
         {
-            // 写操作完成
-            LOG_DEBUG("async write completed: fd=%d, bytes=%d", sockfd, res);
+            // 所有数据发送完成
+            LOG_DEBUG("All data sent: fd=%d, total=%d bytes", sockfd, bytes_total);
 
-            // 重置连接状态，准备下一次读取
-            conn->reset_connection();
-            m_io_uring_manager->submit_read(sockfd, conn->get_read_buffer(),
-                                             http_conn::READ_BUFFER_SIZE, -1, (uint64_t)sockfd);
+            auto timer = users_timer[sockfd].timer;
+            if (timer)
+            {
+                adjust_timer(timer);
+            }
+
+            // 检查是否保持连接
+            if (conn->get_linger())
+            {
+                // 保持连接，重置并继续读取
+                conn->reset_connection();
+                m_io_uring_manager->submit_read(sockfd, conn->get_read_buffer(),
+                                                 http_conn::READ_BUFFER_SIZE, -1,
+                                                 ENCODE_USER_DATA(OP_READ, sockfd));
+            }
+            else
+            {
+                // 关闭连接
+                deal_timer(timer, sockfd);
+            }
         }
+    }
+    else
+    {
+        LOG_ERROR("Unknown operation type: %lu", op_type);
     }
 }
 
