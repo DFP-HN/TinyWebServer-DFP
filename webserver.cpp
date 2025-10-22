@@ -7,6 +7,8 @@
 #include "coroutine/scheduler.h"
 #include "coroutine/advanced_file_upload.h"
 #include "coroutine/advanced_file_download.h"
+#include "coroutine/advanced_file_delete.h"
+#include "coroutine/file_list_api.h"
 #include "http/resumable_upload.h"
 #include "http/http_range.h"
 #endif
@@ -737,11 +739,136 @@ Task<void> WebServer::handle_http_connection_coro(int connfd, struct sockaddr_in
                     break;
                 }
             } else {
-                // 3.2 先检查是否是文件下载请求（在调用 process() 之前）
-                // 快速检查：是否是 "GET /download/"
-                fprintf(stderr, "[DEBUG] Checking for download request, read_buf first 100 chars: %.100s\n", read_buf);
+                // 3.2 检查API路由和文件操作请求
+                fprintf(stderr, "[DEBUG] Checking request type, read_buf first 100 chars: %.100s\n", read_buf);
                 fflush(stderr);
 
+                // 3.2.1 检查文件列表API：GET /api/files
+                if (strstr(read_buf, "GET /api/files HTTP") != nullptr) {
+                    fprintf(stderr, "[DEBUG] File list API request detected!\n");
+                    fflush(stderr);
+
+                    // 调用协程文件列表API处理器
+                    bool success = co_await handle_file_list_api(
+                        connfd,
+                        m_io_uring_manager.get()
+                    );
+
+                    fprintf(stderr, "[DEBUG] After file list API, success=%d\n", success);
+                    fflush(stderr);
+
+                    if (success) {
+                        LOG_INFO("File list API request completed for fd=%d", connfd);
+                    } else {
+                        LOG_ERROR("File list API request failed for fd=%d", connfd);
+                    }
+
+                    // API处理完成，重置连接
+                    conn->reset_connection();
+                    if (!conn->get_linger()) {
+                        break;
+                    }
+                    continue;
+                }
+
+                // 3.2.2 检查文件删除请求：POST /delete/
+                if (strstr(read_buf, "POST /delete/") != nullptr) {
+                    fprintf(stderr, "[DEBUG] Delete request detected!\n");
+                    fflush(stderr);
+
+                    // 手动解析 URL：POST /delete/filename HTTP/1.1
+                    const char* url_start = strstr(read_buf, "POST ");
+                    if (!url_start) {
+                        LOG_ERROR("Invalid POST request for fd=%d", connfd);
+                        break;
+                    }
+                    url_start += 5;  // 跳过 "POST "
+
+                    const char* url_end = strstr(url_start, " HTTP/");
+                    if (!url_end) {
+                        LOG_ERROR("Invalid HTTP request line for fd=%d", connfd);
+                        break;
+                    }
+
+                    // 提取 URL
+                    char url_buffer[256];
+                    size_t url_len = url_end - url_start;
+                    if (url_len >= sizeof(url_buffer)) {
+                        LOG_ERROR("URL too long for fd=%d", connfd);
+                        break;
+                    }
+                    memcpy(url_buffer, url_start, url_len);
+                    url_buffer[url_len] = '\0';
+
+                    fprintf(stderr, "[DEBUG] Extracted delete URL: %s\n", url_buffer);
+                    fflush(stderr);
+
+                    // 检查 URL 是否以 /delete/ 开头
+                    if (strncmp(url_buffer, "/delete/", 8) != 0) {
+                        LOG_ERROR("Invalid delete URL for fd=%d: %s", connfd, url_buffer);
+                        break;
+                    }
+
+                    // 提取文件名（URL 编码）
+                    const char* filename_encoded = url_buffer + 8;  // 跳过 "/delete/"
+
+                    // URL 解码文件名
+                    char filename_decoded[256];
+                    size_t decoded_len = 0;
+                    const char* p = filename_encoded;
+
+                    while (*p && decoded_len < sizeof(filename_decoded) - 1) {
+                        if (*p == '%' && p[1] && p[2]) {
+                            // 解码 %XX
+                            int hex_value = 0;
+                            char hex_str[3] = {p[1], p[2], '\0'};
+                            if (sscanf(hex_str, "%x", &hex_value) == 1) {
+                                filename_decoded[decoded_len++] = (char)hex_value;
+                                p += 3;
+                            } else {
+                                filename_decoded[decoded_len++] = *p++;
+                            }
+                        } else if (*p == '+') {
+                            // '+' 解码为空格
+                            filename_decoded[decoded_len++] = ' ';
+                            p++;
+                        } else {
+                            filename_decoded[decoded_len++] = *p++;
+                        }
+                    }
+                    filename_decoded[decoded_len] = '\0';
+
+                    fprintf(stderr, "[DEBUG] Decoded filename for deletion: %s\n", filename_decoded);
+                    fflush(stderr);
+
+                    // 调用协程文件删除处理器
+                    DeleteResult delete_result = co_await handle_advanced_file_delete(
+                        connfd,
+                        m_io_uring_manager.get(),
+                        filename_decoded
+                    );
+
+                    fprintf(stderr, "[DEBUG] After file delete, success=%d\n", delete_result.success);
+                    fflush(stderr);
+
+                    if (delete_result.success) {
+                        LOG_INFO("File deleted successfully: %s (fd=%d)",
+                                 delete_result.filename.c_str(), connfd);
+                    } else {
+                        LOG_ERROR("File deletion failed: %s (fd=%d, error=%s)",
+                                  delete_result.filename.c_str(), connfd,
+                                  delete_result.error_message.c_str());
+                    }
+
+                    // 删除处理完成，重置连接
+                    conn->reset_connection();
+                    if (!conn->get_linger()) {
+                        break;
+                    }
+                    continue;
+                }
+
+                // 3.2.3 检查文件下载请求：GET /download/
                 bool is_download_request = false;
                 if (strstr(read_buf, "GET /download/") != nullptr) {
                     is_download_request = true;
