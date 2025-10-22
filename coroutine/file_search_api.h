@@ -80,6 +80,18 @@ inline void parse_query_string(const std::string& query, SearchCriteria& criteri
             } else if (key == "date_to") {
                 criteria.date_to = strtol(value.c_str(), nullptr, 10);
             }
+            // 新增参数解析
+            else if (key == "file_type" || key == "type") {
+                criteria.file_type = value;
+            } else if (key == "sort_by" || key == "sort") {
+                criteria.sort_by = value;
+            } else if (key == "sort_order" || key == "order") {
+                criteria.sort_order = value;
+            } else if (key == "regex_mode" || key == "regex") {
+                criteria.regex_mode = (value == "1" || value == "true" || value == "on");
+            } else if (key == "limit") {
+                criteria.limit = atoi(value.c_str());
+            }
         }
 
         start = end + 1;

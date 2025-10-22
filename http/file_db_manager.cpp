@@ -236,10 +236,23 @@ std::vector<FileRecord> FileDBManager::search_files(
         "file_type, extension, UNIX_TIMESTAMP(upload_time) as upload_time "
         "FROM files WHERE status = 1";
 
-    // 添加关键字搜索
+    // 添加关键字搜索（支持正则表达式模式）
     if (!criteria.keyword.empty()) {
         std::string escaped_keyword = escape_string(mysql, criteria.keyword);
-        sql += " AND filename LIKE '%" + escaped_keyword + "%'";
+        if (criteria.regex_mode) {
+            // 正则表达式搜索（MySQL REGEXP）
+            sql += " AND filename REGEXP '" + escaped_keyword + "'";
+            LOG_INFO("Search using REGEXP: %s", escaped_keyword.c_str());
+        } else {
+            // 普通模糊搜索（LIKE）
+            sql += " AND filename LIKE '%" + escaped_keyword + "%'";
+        }
+    }
+
+    // 添加文件类型过滤（新增）
+    if (!criteria.file_type.empty()) {
+        std::string escaped_type = escape_string(mysql, criteria.file_type);
+        sql += " AND file_type = '" + escaped_type + "'";
     }
 
     // 添加扩展名过滤
@@ -264,8 +277,29 @@ std::vector<FileRecord> FileDBManager::search_files(
         sql += " AND UNIX_TIMESTAMP(upload_time) <= " + std::to_string(criteria.date_to);
     }
 
-    // 排序和限制
-    sql += " ORDER BY upload_time DESC LIMIT " + std::to_string(limit);
+    // 动态排序（新增）
+    std::string sort_field = criteria.sort_by.empty() ? "upload_time" : criteria.sort_by;
+    std::string sort_direction = criteria.sort_order.empty() ? "DESC" : criteria.sort_order;
+
+    // 白名单验证（防止SQL注入）
+    bool valid_field = (sort_field == "filename" || sort_field == "file_size" ||
+                       sort_field == "upload_time" || sort_field == "file_type");
+    bool valid_order = (sort_direction == "ASC" || sort_direction == "DESC");
+
+    if (valid_field && valid_order) {
+        sql += " ORDER BY " + sort_field + " " + sort_direction;
+    } else {
+        // 默认排序
+        sql += " ORDER BY upload_time DESC";
+        LOG_WARN("Invalid sort parameters, using default: upload_time DESC");
+    }
+
+    // 结果数量限制（新增可配置）
+    int result_limit = criteria.limit;
+    if (result_limit <= 0 || result_limit > 1000) {
+        result_limit = (limit > 0 && limit <= 1000) ? limit : 100;
+    }
+    sql += " LIMIT " + std::to_string(result_limit);
 
     LOG_DEBUG("Executing search SQL: %s", sql.c_str());
 

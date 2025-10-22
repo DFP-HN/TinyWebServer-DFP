@@ -36,11 +36,20 @@ struct SearchCriteria {
     time_t date_from;           // 起始时间
     time_t date_to;             // 结束时间
 
+    // 增强字段
+    std::string file_type;      // 文件类型过滤 (pdf/video/image/document/archive/audio/other)
+    std::string sort_by;        // 排序字段 (filename/file_size/upload_time/file_type)
+    std::string sort_order;     // 排序方向 (ASC/DESC)
+    bool regex_mode;            // 正则表达式模式
+    int limit;                  // 结果数量限制 (1-1000)
+
     SearchCriteria()
         : size_min(0),
           size_max(UINT64_MAX),
           date_from(0),
-          date_to(0) {}
+          date_to(0),
+          regex_mode(false),
+          limit(100) {}
 };
 
 /**
