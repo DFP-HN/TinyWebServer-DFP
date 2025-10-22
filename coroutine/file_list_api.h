@@ -4,92 +4,38 @@
 #include "../coroutine/task.h"
 #include "../coroutine/io_awaiter.h"
 #include "../io_uring/io_uring_manager.h"
+#include "../http/file_db_manager.h"
+#include "../CGImysql/sql_connection_pool.h"
 #include "../log/log.h"
 #include <string>
 #include <vector>
-#include <dirent.h>
-#include <sys/stat.h>
 #include <cstring>
 #include <cstdio>
 #include <algorithm>
 
 /**
- * @brief 文件信息结构
- */
-struct FileInfo {
-    std::string name;
-    size_t size;
-    time_t mtime;  // 修改时间
-
-    // 排序：按修改时间降序（最新的在前）
-    bool operator<(const FileInfo& other) const {
-        return mtime > other.mtime;
-    }
-};
-
-/**
- * @brief 扫描目录获取文件列表
+ * @brief 从数据库加载文件列表
  *
- * @param upload_dir 要扫描的目录路径
- * @param files 输出参数，存储文件信息列表
- * @return 是否成功扫描
+ * @param mysql MySQL连接
+ * @param files 输出参数，存储文件记录列表
+ * @return 是否成功查询
  */
-inline bool scan_directory_files(const char* upload_dir, std::vector<FileInfo>& files) {
-    fprintf(stderr, "[DEBUG FILE_LIST] Scanning directory: %s\n", upload_dir);
+inline bool load_files_from_database(MYSQL* mysql, std::vector<FileRecord>& files) {
+    fprintf(stderr, "[DEBUG FILE_LIST] Querying files from database\n");
     fflush(stderr);
 
-    DIR* dir = opendir(upload_dir);
-    if (!dir) {
-        LOG_ERROR("Failed to open directory %s: %s", upload_dir, strerror(errno));
+    if (!mysql) {
+        LOG_ERROR("Invalid MySQL connection");
         return false;
     }
 
-    struct dirent* entry;
-    int file_count = 0;
+    // 查询所有文件（按上传时间降序，最多1000条）
+    files = FileDBManager::query_all_files(mysql, "upload_time DESC", 1000);
 
-    while ((entry = readdir(dir)) != nullptr) {
-        // 跳过 . 和 ..
-        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
-            continue;
-        }
-
-        // 构建完整路径
-        char full_path[1024];
-        snprintf(full_path, sizeof(full_path), "%s/%s", upload_dir, entry->d_name);
-
-        // 获取文件信息
-        struct stat file_stat;
-        if (stat(full_path, &file_stat) != 0) {
-            LOG_WARN("Failed to stat file %s: %s", full_path, strerror(errno));
-            continue;
-        }
-
-        // 只包含普通文件（不包含目录和特殊文件）
-        if (!S_ISREG(file_stat.st_mode)) {
-            continue;
-        }
-
-        FileInfo file_info;
-        file_info.name = entry->d_name;
-        file_info.size = file_stat.st_size;
-        file_info.mtime = file_stat.st_mtime;
-
-        files.push_back(file_info);
-        file_count++;
-
-        fprintf(stderr, "[DEBUG FILE_LIST] Found file: %s (size=%zu, mtime=%ld)\n",
-                entry->d_name, file_info.size, (long)file_info.mtime);
-        fflush(stderr);
-    }
-
-    closedir(dir);
-
-    // 排序：按修改时间降序
-    std::sort(files.begin(), files.end());
-
-    fprintf(stderr, "[DEBUG FILE_LIST] Scanned %d files\n", file_count);
+    fprintf(stderr, "[DEBUG FILE_LIST] Database returned %zu files\n", files.size());
     fflush(stderr);
 
+    LOG_INFO("Loaded %zu files from database", files.size());
     return true;
 }
 
@@ -144,8 +90,10 @@ inline std::string json_escape(const std::string& str) {
  *     ...
  *   ]
  * }
+ *
+ * 注意：为保持与前端兼容，使用 name/size/mtime 字段名
  */
-inline std::string build_file_list_json(const std::vector<FileInfo>& files) {
+inline std::string build_file_list_json(const std::vector<FileRecord>& files) {
     std::string json = "{\"success\":true,\"count\":";
     json += std::to_string(files.size());
     json += ",\"files\":[";
@@ -156,11 +104,11 @@ inline std::string build_file_list_json(const std::vector<FileInfo>& files) {
         }
 
         json += "{\"name\":\"";
-        json += json_escape(files[i].name);
+        json += json_escape(files[i].filename);  // FileRecord.filename → name
         json += "\",\"size\":";
-        json += std::to_string(files[i].size);
+        json += std::to_string(files[i].file_size);  // FileRecord.file_size → size
         json += ",\"mtime\":";
-        json += std::to_string(files[i].mtime);
+        json += std::to_string(files[i].upload_time);  // FileRecord.upload_time → mtime
         json += "}";
     }
 
@@ -169,53 +117,63 @@ inline std::string build_file_list_json(const std::vector<FileInfo>& files) {
 }
 
 /**
- * @brief 协程动态文件列表API处理器
+ * @brief 协程数据库驱动文件列表API处理器
  *
  * 功能特性：
- * - 扫描指定目录获取所有文件
+ * - 从MySQL数据库查询所有文件记录
  * - 返回JSON格式的文件列表
- * - 包含文件名、大小、修改时间
- * - 按修改时间降序排序
- * - 自动过滤目录和特殊文件
+ * - 包含文件名、大小、上传时间
+ * - 按上传时间降序排序（最新的在前）
+ * - 支持最多1000条记录
+ * - 索引优化查询性能
  *
  * API路径: GET /api/files
  *
  * 使用示例：
  * @code
  * bool success = co_await handle_file_list_api(
- *     sockfd, io_mgr, "./root/uploads"
+ *     sockfd, io_mgr, connPool
  * );
  * @endcode
  */
 inline Task<bool> handle_file_list_api(
     int sockfd,
     IoUringManager* io_mgr,
-    const char* upload_dir = "./root/uploads"
+    connection_pool* connPool
 ) {
     fprintf(stderr, "[DEBUG FILE_LIST] Entered handle_file_list_api, sockfd=%d\n", sockfd);
     fflush(stderr);
 
     try {
-        // 1. 扫描目录获取文件列表
-        std::vector<FileInfo> files;
-        bool scan_success = scan_directory_files(upload_dir, files);
+        // 1. 获取数据库连接
+        MYSQL* mysql = nullptr;
+        connectionRAII mysqlcon(&mysql, connPool);
 
         std::string json_body;
 
-        if (!scan_success) {
-            // 扫描失败（目录不存在或权限不足）
-            json_body = "{\"success\":false,\"message\":\"无法读取目录\"}";
-            LOG_ERROR("Failed to scan directory: %s", upload_dir);
+        if (!mysql) {
+            // 数据库连接失败
+            json_body = "{\"success\":false,\"message\":\"数据库连接失败\"}";
+            LOG_ERROR("Failed to get MySQL connection for file list API");
         } else {
-            // 2. 构建JSON响应
-            json_body = build_file_list_json(files);
-            LOG_INFO("File list API: returning %zu files", files.size());
+            // 2. 从数据库查询文件列表
+            std::vector<FileRecord> files;
+            bool query_success = load_files_from_database(mysql, files);
+
+            if (!query_success) {
+                json_body = "{\"success\":false,\"message\":\"查询文件列表失败\"}";
+                LOG_ERROR("Failed to query files from database");
+            } else {
+                // 3. 构建JSON响应
+                json_body = build_file_list_json(files);
+                LOG_INFO("File list API: returning %zu files from database", files.size());
+            }
         }
 
         fprintf(stderr, "[DEBUG FILE_LIST] JSON body length: %zu\n", json_body.length());
         fflush(stderr);
 
-        // 3. 发送HTTP响应
+        // 4. 发送HTTP响应
         std::string http_response;
         http_response.reserve(json_body.length() + 256);
 

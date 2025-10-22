@@ -2,18 +2,18 @@
 
 # 是否启用 io_uring 支持（需要 Linux 5.1+ 和 liburing）
 # 设置为 1 启用，0 禁用
-USE_IO_URING ?= 0
+USE_IO_URING ?= 1
 
 # 是否启用 C++20 协程支持（需要 GCC 10+ 或 Clang 10+）
 # 设置为 1 启用，0 禁用
-USE_COROUTINE ?= 0
+USE_COROUTINE ?= 1
 
 # 是否启用零拷贝优化（sendfile/splice）
 # 设置为 1 启用，0 禁用
 USE_ZERO_COPY ?= 1
 
 # 编译器选择
-CXX ?= g++
+CXX ?= g++-10
 
 # 调试模式
 DEBUG ?= 1
@@ -41,7 +41,8 @@ else
 endif
 
 ifeq ($(USE_COROUTINE), 1)
-    CXXFLAGS += -DUSE_COROUTINE -std=c++20 -fcoroutines
+    CXXFLAGS += -DUSE_COROUTINE -std=c++2a -fcoroutines
+    LDFLAGS += -lssl -lcrypto
     $(info [INFO] C++20 coroutine support enabled)
 else
     $(info [INFO] C++20 coroutine support disabled)

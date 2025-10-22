@@ -9,6 +9,7 @@
 #include "coroutine/advanced_file_download.h"
 #include "coroutine/advanced_file_delete.h"
 #include "coroutine/file_list_api.h"
+#include "coroutine/file_search_api.h"
 #include "http/resumable_upload.h"
 #include "http/http_range.h"
 #endif
@@ -708,6 +709,7 @@ Task<void> WebServer::handle_http_connection_coro(int connfd, struct sockaddr_in
                         m_io_uring_manager.get(),
                         content_type_saved.c_str(),
                         content_length,
+                        m_connPool,             // 数据库连接池
                         upload_config,
                         progress_cb,
                         prebuffer_copy.empty() ? nullptr : prebuffer_copy.data(),  // 使用副本
@@ -751,7 +753,8 @@ Task<void> WebServer::handle_http_connection_coro(int connfd, struct sockaddr_in
                     // 调用协程文件列表API处理器
                     bool success = co_await handle_file_list_api(
                         connfd,
-                        m_io_uring_manager.get()
+                        m_io_uring_manager.get(),
+                        m_connPool              // 数据库连接池
                     );
 
                     fprintf(stderr, "[DEBUG] After file list API, success=%d\n", success);
@@ -771,7 +774,54 @@ Task<void> WebServer::handle_http_connection_coro(int connfd, struct sockaddr_in
                     continue;
                 }
 
-                // 3.2.2 检查文件删除请求：POST /delete/
+                // 3.2.2 检查文件搜索API：GET /api/search?q=...
+                if (strstr(read_buf, "GET /api/search") != nullptr) {
+                    fprintf(stderr, "[DEBUG] File search API request detected!\n");
+                    fflush(stderr);
+
+                    // 解析查询字符串
+                    std::string query_string;
+                    const char* query_start = strstr(read_buf, "GET /api/search");
+                    if (query_start) {
+                        query_start = strchr(query_start, '?');
+                        if (query_start) {
+                            query_start++;  // 跳过 '?'
+                            const char* query_end = strstr(query_start, " HTTP/");
+                            if (query_end) {
+                                query_string.assign(query_start, query_end - query_start);
+                            }
+                        }
+                    }
+
+                    fprintf(stderr, "[DEBUG] Search query string: %s\n", query_string.c_str());
+                    fflush(stderr);
+
+                    // 调用协程文件搜索API处理器
+                    bool success = co_await handle_file_search_api(
+                        connfd,
+                        m_io_uring_manager.get(),
+                        query_string,
+                        m_connPool              // 数据库连接池
+                    );
+
+                    fprintf(stderr, "[DEBUG] After file search API, success=%d\n", success);
+                    fflush(stderr);
+
+                    if (success) {
+                        LOG_INFO("File search API request completed for fd=%d", connfd);
+                    } else {
+                        LOG_ERROR("File search API request failed for fd=%d", connfd);
+                    }
+
+                    // API处理完成，重置连接
+                    conn->reset_connection();
+                    if (!conn->get_linger()) {
+                        break;
+                    }
+                    continue;
+                }
+
+                // 3.2.3 检查文件删除请求：POST /delete/
                 if (strstr(read_buf, "POST /delete/") != nullptr) {
                     fprintf(stderr, "[DEBUG] Delete request detected!\n");
                     fflush(stderr);
@@ -845,7 +895,8 @@ Task<void> WebServer::handle_http_connection_coro(int connfd, struct sockaddr_in
                     DeleteResult delete_result = co_await handle_advanced_file_delete(
                         connfd,
                         m_io_uring_manager.get(),
-                        filename_decoded
+                        filename_decoded,
+                        m_connPool              // 数据库连接池
                     );
 
                     fprintf(stderr, "[DEBUG] After file delete, success=%d\n", delete_result.success);

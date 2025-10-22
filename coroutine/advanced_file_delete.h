@@ -4,6 +4,8 @@
 #include "../coroutine/task.h"
 #include "../coroutine/io_awaiter.h"
 #include "../io_uring/io_uring_manager.h"
+#include "../http/file_db_manager.h"
+#include "../CGImysql/sql_connection_pool.h"
 #include "../log/log.h"
 #include <string>
 #include <unistd.h>
@@ -80,11 +82,13 @@ inline Task<bool> send_json_response(
 }
 
 /**
- * @brief 协程文件删除处理器
+ * @brief 协程文件删除处理器（支持数据库同步）
  *
  * 功能特性：
  * - 文件名安全验证（防止路径遍历攻击）
  * - 仅允许删除指定目录的文件
+ * - 数据库软删除同步（设置status=0）
+ * - 先删除数据库记录，再删除物理文件
  * - JSON格式响应
  * - 详细的错误信息
  * - 操作日志记录
@@ -92,7 +96,7 @@ inline Task<bool> send_json_response(
  * 使用示例：
  * @code
  * DeleteResult result = co_await handle_advanced_file_delete(
- *     sockfd, io_mgr, "test.pdf", "./root/uploads"
+ *     sockfd, io_mgr, "test.pdf", connPool, "./root/uploads"
  * );
  * @endcode
  */
@@ -100,6 +104,7 @@ inline Task<DeleteResult> handle_advanced_file_delete(
     int sockfd,
     IoUringManager* io_mgr,
     const char* filename,
+    connection_pool* connPool,
     const char* upload_dir = "./root/uploads"
 ) {
     fprintf(stderr, "[DEBUG DELETE] Entered handle_advanced_file_delete, sockfd=%d, filename=%s\n",
@@ -163,8 +168,32 @@ inline Task<DeleteResult> handle_advanced_file_delete(
             co_return result;
         }
 
-        // 5. 执行删除操作
-        fprintf(stderr, "[DEBUG DELETE] Step 4: Deleting file: %s\n", file_path);
+        // 5. 数据库软删除（先删除数据库记录）
+        fprintf(stderr, "[DEBUG DELETE] Step 5: Soft-deleting from database: %s\n", file_path);
+        fflush(stderr);
+
+        MYSQL* mysql = nullptr;
+        connectionRAII mysqlcon(&mysql, connPool);
+
+        if (!mysql) {
+            // 数据库连接失败 - 记录警告，继续删除物理文件
+            LOG_WARN("Failed to get MySQL connection for file deletion, continuing with physical delete");
+        } else {
+            // 尝试软删除数据库记录
+            bool db_delete_success = FileDBManager::delete_file_by_path(mysql, file_path);
+
+            if (!db_delete_success) {
+                // 数据库删除失败 - 记录警告，继续删除物理文件
+                LOG_WARN("Failed to delete file record from database: %s (continuing with physical delete)", file_path);
+            } else {
+                fprintf(stderr, "[DEBUG DELETE] Database record soft-deleted successfully\n");
+                fflush(stderr);
+                LOG_INFO("File record soft-deleted from database: %s", file_path);
+            }
+        }
+
+        // 6. 执行物理文件删除
+        fprintf(stderr, "[DEBUG DELETE] Step 6: Deleting physical file: %s\n", file_path);
         fflush(stderr);
 
         if (unlink(file_path) != 0) {
@@ -178,7 +207,7 @@ inline Task<DeleteResult> handle_advanced_file_delete(
             co_return result;
         }
 
-        // 6. 删除成功
+        // 7. 删除成功
         fprintf(stderr, "[DEBUG DELETE] File deleted successfully: %s\n", file_path);
         fflush(stderr);
 

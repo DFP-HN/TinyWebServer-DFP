@@ -6,6 +6,7 @@ SRCS = main.cpp \
        config.cpp \
        webserver.cpp \
        http/http_conn.cpp \
+       http/file_db_manager.cpp \
        ./timer/lst_timer.cpp \
        ./log/log.cpp \
        ./CGImysql/sql_connection_pool.cpp \
@@ -21,6 +22,10 @@ endif
 
 ifeq ($(USE_IO_URING), 1)
     SRCS += io_uring/io_uring_manager.cpp
+endif
+
+ifeq ($(USE_COROUTINE), 1)
+    SRCS += http/streaming_multipart_parser.cpp
 endif
 
 server: $(SRCS)
