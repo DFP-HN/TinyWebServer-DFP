@@ -1,6 +1,12 @@
 #include "webserver.h"
 #include <cstdlib>  // for getenv
 
+#ifdef USE_COROUTINE
+#include "coroutine/task.h"
+#include "coroutine/io_awaiter.h"
+#include "coroutine/scheduler.h"
+#endif
+
 WebServer::WebServer()
 {
     // 创建管理器实例（使用 make_unique 智能指针）
@@ -8,10 +14,10 @@ WebServer::WebServer()
     m_user_manager = std::make_unique<UserManager>();
     m_static_cache = std::make_unique<StaticCache>(256);  // 256MB缓存
 
-// #ifdef USE_IO_URING
+#ifdef USE_IO_URING
     // 创建 io_uring 管理器（队列深度 256）
     m_io_uring_manager = std::make_unique<IoUringManager>(256);
-// #endif
+#endif
 
     // 创建 http_conn 对象数组（使用智能指针）
     users = std::make_unique<http_conn[]>(MAX_FD);
@@ -64,8 +70,8 @@ void WebServer::init(int port, string user, string passWord, string databaseName
     m_event_loop_mode = event_loop_mode;
 
 #ifdef USE_IO_URING
-    // 如果使用 io_uring 模式，初始化 io_uring 管理器
-    if (m_event_loop_mode == IO_URING_MODE && m_io_uring_manager)
+    // 如果使用 io_uring 模式（回调或协程），初始化 io_uring 管理器
+    if ((m_event_loop_mode == IO_URING_MODE || m_event_loop_mode == COROUTINE_MODE) && m_io_uring_manager)
     {
         if (!m_io_uring_manager->init())
         {
@@ -74,12 +80,24 @@ void WebServer::init(int port, string user, string passWord, string databaseName
         }
         else
         {
-            LOG_INFO("io_uring initialized successfully");
+            if (m_event_loop_mode == IO_URING_MODE)
+            {
+                LOG_INFO("io_uring initialized successfully (callback style)");
+            }
+            else if (m_event_loop_mode == COROUTINE_MODE)
+            {
+#ifdef USE_COROUTINE
+                LOG_INFO("io_uring initialized successfully (coroutine style)");
+#else
+                LOG_WARN("Coroutine not compiled, falling back to io_uring callback mode");
+                m_event_loop_mode = IO_URING_MODE;
+#endif
+            }
         }
     }
 #else
     // 如果没有编译 io_uring 支持，强制使用 epoll 模式
-    if (m_event_loop_mode == IO_URING_MODE)
+    if (m_event_loop_mode == IO_URING_MODE || m_event_loop_mode == COROUTINE_MODE)
     {
         LOG_WARN("io_uring not compiled, falling back to epoll mode");
         m_event_loop_mode = EPOLL_MODE;
@@ -500,6 +518,335 @@ void WebServer::eventLoop()
         }
     }
 }
+
+// ==================== 协程实现 ====================
+
+#ifdef USE_COROUTINE
+/**
+ * @brief 协程版本：处理单个 HTTP 连接的完整生命周期
+ *
+ * 这个协程负责：
+ * 1. 读取客户端请求
+ * 2. 解析 HTTP 请求
+ * 3. 处理业务逻辑
+ * 4. 发送响应
+ * 5. 处理 Keep-Alive 或关闭连接
+ *
+ * @param connfd 客户端连接的文件描述符
+ * @param client_address 客户端地址信息
+ */
+Task<void> WebServer::handle_http_connection_coro(int connfd, struct sockaddr_in client_address)
+{
+    LOG_INFO("Starting coroutine for connection fd=%d, client=%s",
+             connfd, inet_ntoa(client_address.sin_addr));
+
+    // 1. 初始化连接和定时器
+    timer(connfd, client_address);
+    http_conn* conn = &users[connfd];
+    auto timer_obj = users_timer[connfd].timer;
+
+    try {
+        // 主循环：处理多个请求（Keep-Alive）
+        while (true) {
+            // 2. 异步读取客户端请求
+            LOG_DEBUG("Coroutine: waiting for read on fd=%d", connfd);
+
+            ssize_t bytes_read = co_await async_read(
+                m_io_uring_manager.get(),
+                connfd,
+                conn->get_read_buffer() + conn->get_read_idx(),
+                http_conn::READ_BUFFER_SIZE - conn->get_read_idx(),
+                -1  // offset: -1 表示当前位置
+            );
+
+            // 检查连接是否关闭
+            if (bytes_read == 0) {
+                LOG_INFO("Client closed connection: fd=%d", connfd);
+                break;
+            }
+
+            LOG_DEBUG("Coroutine: read %ld bytes from fd=%d", bytes_read, connfd);
+
+            // 更新读取的字节数
+            conn->get_read_idx() += bytes_read;
+
+            // 调整定时器（延长超时时间）
+            if (timer_obj) {
+                adjust_timer(timer_obj);
+            }
+
+            // 3. 解析和处理 HTTP 请求
+            LOG_DEBUG("Coroutine: processing HTTP request for fd=%d", connfd);
+            conn->process();
+
+            // 4. 检查是否有响应需要发送
+            if (conn->get_bytes_to_send() == 0) {
+                LOG_WARN("No response to send for fd=%d", connfd);
+                break;
+            }
+
+            // 5. 发送响应
+            LOG_DEBUG("Coroutine: sending response to fd=%d, bytes=%d",
+                      connfd, conn->get_bytes_to_send());
+
+            // 5.1 发送响应头
+            struct iovec* iv = conn->get_iovec();
+            int iv_count = conn->get_iovec_count();
+
+            if (iv_count > 0 && iv[0].iov_len > 0) {
+                ssize_t bytes_written = co_await async_write(
+                    m_io_uring_manager.get(),
+                    connfd,
+                    iv[0].iov_base,
+                    iv[0].iov_len,
+                    -1
+                );
+
+                LOG_DEBUG("Coroutine: wrote header %ld bytes to fd=%d", bytes_written, connfd);
+                conn->add_bytes_have_send(bytes_written);
+            }
+
+            // 5.2 如果有文件内容，发送文件
+            if (iv_count > 1 && iv[1].iov_len > 0) {
+                size_t file_size = iv[1].iov_len;
+                size_t file_sent = 0;
+                const size_t CHUNK_SIZE = 128 * 1024;  // 128KB 分块
+
+                // 检查是否使用 sendfile 模式
+                if (conn->is_using_sendfile()) {
+                    // sendfile 模式：需要从文件描述符读取数据
+                    int file_fd = conn->get_file_fd();
+                    std::unique_ptr<char[]> chunk_buffer(new char[CHUNK_SIZE]);
+
+                    while (file_sent < file_size) {
+                        size_t send_size = std::min(CHUNK_SIZE, file_size - file_sent);
+
+                        // 使用 pread 读取文件内容
+                        ssize_t read_bytes = pread(file_fd, chunk_buffer.get(), send_size, file_sent);
+                        if (read_bytes <= 0) {
+                            throw IoError("File read failed for sendfile mode");
+                        }
+
+                        // 写入网络
+                        ssize_t bytes_written = co_await async_write(
+                            m_io_uring_manager.get(),
+                            connfd,
+                            chunk_buffer.get(),
+                            read_bytes,
+                            -1
+                        );
+
+                        if (bytes_written <= 0) {
+                            throw IoError("File write failed");
+                        }
+
+                        file_sent += bytes_written;
+                        conn->add_bytes_have_send(bytes_written);
+
+                        LOG_DEBUG("Coroutine: wrote file chunk %ld bytes to fd=%d (total=%zu/%zu)",
+                                  bytes_written, connfd, file_sent, file_size);
+                    }
+                } else {
+                    // mmap 模式：直接从内存写入
+                    while (file_sent < file_size) {
+                        size_t send_size = std::min(CHUNK_SIZE, file_size - file_sent);
+                        char* file_base = (char*)iv[1].iov_base + file_sent;
+
+                        ssize_t bytes_written = co_await async_write(
+                            m_io_uring_manager.get(),
+                            connfd,
+                            file_base,
+                            send_size,
+                            -1
+                        );
+
+                        if (bytes_written <= 0) {
+                            throw IoError("File write failed");
+                        }
+
+                        file_sent += bytes_written;
+                        conn->add_bytes_have_send(bytes_written);
+
+                        LOG_DEBUG("Coroutine: wrote file chunk %ld bytes to fd=%d (total=%zu/%zu)",
+                                  bytes_written, connfd, file_sent, file_size);
+                    }
+                }
+            }
+
+            LOG_INFO("Coroutine: completed response for fd=%d, total=%d bytes",
+                     connfd, conn->get_bytes_have_send());
+
+            // 调整定时器
+            if (timer_obj) {
+                adjust_timer(timer_obj);
+            }
+
+            // 6. 检查是否保持连接
+            if (!conn->get_linger()) {
+                LOG_DEBUG("Connection not persistent, closing fd=%d", connfd);
+                break;
+            }
+
+            // 重置连接状态，准备处理下一个请求
+            conn->reset_connection();
+            LOG_DEBUG("Connection reset for Keep-Alive: fd=%d", connfd);
+        }
+    }
+    catch (const IoError& e) {
+        LOG_ERROR("I/O error on fd=%d: %s (errno=%d)", connfd, e.what(), e.error_code);
+    }
+    catch (const std::exception& e) {
+        LOG_ERROR("Exception on fd=%d: %s", connfd, e.what());
+    }
+
+    // 清理：关闭连接并删除定时器
+    LOG_INFO("Closing connection fd=%d", connfd);
+    deal_timer(timer_obj, connfd);
+
+    co_return;
+}
+
+/**
+ * @brief 协程版本：持续接受新的客户端连接
+ *
+ * 这个协程负责：
+ * 1. 循环等待新的客户端连接
+ * 2. 接受连接后，为每个连接启动独立的处理协程
+ * 3. 检查连接数限制
+ *
+ * @param scheduler 协程调度器，用于启动新的连接处理协程
+ */
+Task<void> WebServer::accept_connections_coro(CoroScheduler* scheduler)
+{
+    fprintf(stderr, "[DEBUG] accept_connections_coro: START, listen_fd=%d\n", m_listenfd);
+    fflush(stderr);
+    LOG_INFO("Starting accept coroutine on listen_fd=%d", m_listenfd);
+
+    // 分配地址结构（重复使用）
+    struct sockaddr_in client_address;
+    socklen_t client_addrlen;
+
+    try {
+        // 主循环：持续接受新连接
+        while (true) {
+            // 重置地址结构
+            bzero(&client_address, sizeof(client_address));
+            client_addrlen = sizeof(client_address);
+
+            // 异步接受新连接
+            fprintf(stderr, "[DEBUG] accept_connections_coro: Before co_await async_accept\n");
+            fflush(stderr);
+            LOG_DEBUG("Accept coroutine: waiting for new connection...");
+
+            int connfd = co_await async_accept(
+                m_io_uring_manager.get(),
+                m_listenfd,
+                (struct sockaddr*)&client_address,
+                &client_addrlen
+            );
+
+            fprintf(stderr, "[DEBUG] accept_connections_coro: After co_await, connfd=%d\n", connfd);
+            fflush(stderr);
+
+            LOG_INFO("Accept coroutine: accepted new connection fd=%d from %s:%d",
+                     connfd,
+                     inet_ntoa(client_address.sin_addr),
+                     ntohs(client_address.sin_port));
+
+            // 检查连接数限制
+            if (m_user_manager->get_user_count() >= MAX_FD) {
+                LOG_ERROR("Server busy: too many connections (%d >= %d)",
+                          m_user_manager->get_user_count(), MAX_FD);
+                utils.show_error(connfd, "Internal server busy");
+                close(connfd);
+                continue;
+            }
+
+            // 为新连接启动处理协程
+            LOG_DEBUG("Accept coroutine: spawning handler for fd=%d", connfd);
+            scheduler->spawn(handle_http_connection_coro(connfd, client_address));
+        }
+    }
+    catch (const IoError& e) {
+        LOG_ERROR("Accept error: %s (errno=%d)", e.what(), e.error_code);
+    }
+    catch (const std::exception& e) {
+        LOG_ERROR("Accept exception: %s", e.what());
+    }
+
+    LOG_WARN("Accept coroutine terminated");
+    co_return;
+}
+
+/**
+ * @brief 协程版本的事件循环
+ *
+ * 使用协程调度器管理所有 I/O 操作：
+ * 1. 创建协程调度器
+ * 2. 启动 accept 协程（负责接受新连接）
+ * 3. 运行调度器（自动调度所有协程）
+ *
+ * 优势：
+ * - 代码清晰：不需要手动管理状态机
+ * - 易于维护：每个连接的逻辑都在独立的协程中
+ * - 异常安全：协程自动处理异常和清理
+ */
+void WebServer::eventLoop_coro()
+{
+    fprintf(stderr, "[DEBUG] eventLoop_coro: START\n");
+    fflush(stderr);
+
+    if (!m_io_uring_manager || !m_io_uring_manager->is_initialized())
+    {
+        fprintf(stderr, "[DEBUG] io_uring not initialized!\n");
+        fflush(stderr);
+        LOG_ERROR("io_uring not initialized, cannot start coroutine event loop");
+        return;
+    }
+
+    fprintf(stderr, "[DEBUG] Creating scheduler...\n");
+    fflush(stderr);
+    LOG_INFO("Starting coroutine event loop (queue depth=%u)",
+             m_io_uring_manager->get_queue_depth());
+
+    // 创建协程调度器
+    LOG_INFO("Creating coroutine scheduler...");
+    CoroScheduler scheduler(m_io_uring_manager.get());
+    fprintf(stderr, "[DEBUG] Scheduler created\n");
+    fflush(stderr);
+    LOG_INFO("Coroutine scheduler created");
+
+    // 启动 accept 协程（负责接受新连接）
+    fprintf(stderr, "[DEBUG] Creating accept_connections_coro...\n");
+    fflush(stderr);
+    LOG_INFO("Spawning accept coroutine...");
+
+    fprintf(stderr, "[DEBUG] Calling accept_connections_coro(&scheduler)...\n");
+    fflush(stderr);
+    auto accept_task = accept_connections_coro(&scheduler);
+    fprintf(stderr, "[DEBUG] accept_connections_coro returned a Task\n");
+    fflush(stderr);
+
+    fprintf(stderr, "[DEBUG] Calling scheduler.spawn()...\n");
+    fflush(stderr);
+    scheduler.spawn(std::move(accept_task));
+    fprintf(stderr, "[DEBUG] Accept coroutine spawned\n");
+    fflush(stderr);
+    LOG_INFO("Accept coroutine spawned");
+
+    // 运行事件循环（调度器会自动管理所有协程）
+    fprintf(stderr, "[DEBUG] Running scheduler...\n");
+    fflush(stderr);
+    LOG_INFO("Running coroutine scheduler...");
+    scheduler.run();
+
+    fprintf(stderr, "[DEBUG] Scheduler stopped\n");
+    fflush(stderr);
+    LOG_INFO("Coroutine event loop stopped");
+}
+#endif  // USE_COROUTINE
+
+// ==================== io_uring 回调实现 ====================
 
 #ifdef USE_IO_URING
 // io_uring user_data 编码：高32位=操作类型，低32位=fd

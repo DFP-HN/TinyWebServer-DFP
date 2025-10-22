@@ -26,14 +26,21 @@
 #include "./io_uring/io_uring_manager.h"
 // #endif
 
+#ifdef USE_COROUTINE
+// 前向声明
+template<typename T> class Task;
+class CoroScheduler;
+#endif
+
 const int MAX_FD = 65536;           //最大文件描述符
 const int MAX_EVENT_NUMBER = 10000; //最大事件数
 const int TIMESLOT = 10;            //最小超时单位（优化为10秒，Keep-Alive超时为3*TIMESLOT=30秒）
 
 // 事件循环模式
 enum EventLoopMode {
-    EPOLL_MODE = 0,     // 传统 epoll 模式
-    IO_URING_MODE = 1   // io_uring 异步 I/O 模式
+    EPOLL_MODE = 0,       // 传统 epoll 模式
+    IO_URING_MODE = 1,    // io_uring 异步 I/O 模式（回调风格）
+    COROUTINE_MODE = 2    // io_uring + 协程模式（C++20）
 };
 
 // 重构后的WebServer类
@@ -56,9 +63,18 @@ public:
     void eventLoop();
 
 // #ifdef USE_IO_URING
-    // io_uring 事件循环
+    // io_uring 事件循环（回调风格）
     void eventLoop_uring();
 // #endif
+
+#ifdef USE_COROUTINE
+    // 协程事件循环
+    void eventLoop_coro();
+
+    // 协程函数
+    Task<void> handle_http_connection_coro(int connfd, struct sockaddr_in client_address);
+    Task<void> accept_connections_coro(CoroScheduler* scheduler);
+#endif
 
     void timer(int connfd, struct sockaddr_in client_address);
     void adjust_timer(std::shared_ptr<util_timer> timer);
@@ -69,7 +85,7 @@ public:
     void dealwithwrite(int sockfd);
 
 // #ifdef USE_IO_URING
-    // io_uring 专用方法
+    // io_uring 专用方法（回调风格）
     void dealclientdata_uring();
     void dealwithread_uring(int sockfd);
     void dealwithwrite_uring(int sockfd);
@@ -119,9 +135,9 @@ public:
     std::unique_ptr<StaticCache> m_static_cache;    // 静态文件缓存
     std::unique_ptr<Log> m_logger;                  // 日志系统
 
-// #ifdef USE_IO_URING
+#ifdef USE_IO_URING
     std::unique_ptr<IoUringManager> m_io_uring_manager;  // io_uring 管理器
-// #endif
+#endif
 };
 
 #endif

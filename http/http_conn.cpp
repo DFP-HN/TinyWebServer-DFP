@@ -293,6 +293,8 @@ http_conn::HTTP_CODE http_conn::parse_request_line(char *text)
         m_method = POST;
         cgi = 1;
     }
+    else if (strcasecmp(method, "HEAD") == 0)
+        m_method = HEAD;
     else
         return BAD_REQUEST;
     m_url += strspn(m_url, " \t");
@@ -621,7 +623,7 @@ http_conn::HTTP_CODE http_conn::do_request()
         return BAD_REQUEST;
 
     // 静态内容缓存优化：对于GET请求尝试从缓存获取
-    if (m_static_cache && m_method == GET && cgi == 0)
+    if (m_static_cache && (m_method == GET || m_method == HEAD) && cgi == 0)
     {
         std::shared_ptr<CacheEntry> cached = m_static_cache->get(std::string(m_real_file));
         if (cached && cached->last_modified == m_file_stat.st_mtime)
@@ -683,7 +685,7 @@ http_conn::HTTP_CODE http_conn::do_request()
         }
 
         // 加入缓存（仅对小文件且GET请求）
-        if (m_static_cache && m_method == GET && cgi == 0 &&
+        if (m_static_cache && (m_method == GET || m_method == HEAD) && cgi == 0 &&
             m_file_stat.st_size <= CACHE_THRESHOLD)
         {
             m_static_cache->put(std::string(m_real_file),
@@ -921,7 +923,7 @@ bool http_conn::add_headers(int content_len)
         return false;
 
     // 对于静态资源添加缓存控制
-    if (m_method == GET && cgi == 0)
+    if ((m_method == GET || m_method == HEAD) && cgi == 0)
     {
         // Cache-Control: 静态资源缓存1小时
         add_cache_control("public, max-age=3600");
@@ -1082,18 +1084,32 @@ bool http_conn::process_write(HTTP_CODE ret)
             add_headers(m_file_stat.st_size);
             m_iv[0].iov_base = m_write_buf;
             m_iv[0].iov_len = m_write_idx;
-            m_iv[1].iov_base = m_file_address;
-            m_iv[1].iov_len = m_file_stat.st_size;
-            m_iv_count = 2;
-            bytes_to_send = m_write_idx + m_file_stat.st_size;
+
+            // HEAD请求只返回头部，不返回文件内容
+            if (m_method == HEAD)
+            {
+                m_iv_count = 1;
+                bytes_to_send = m_write_idx;
+            }
+            else
+            {
+                m_iv[1].iov_base = m_file_address;
+                m_iv[1].iov_len = m_file_stat.st_size;
+                m_iv_count = 2;
+                bytes_to_send = m_write_idx + m_file_stat.st_size;
+            }
             return true;
         }
         else
         {
             const char *ok_string = "<html><body></body></html>";
             add_headers(strlen(ok_string));
-            if (!add_content(ok_string))
-                return false;
+            // HEAD请求不需要发送body
+            if (m_method != HEAD)
+            {
+                if (!add_content(ok_string))
+                    return false;
+            }
         }
     }
     default:
