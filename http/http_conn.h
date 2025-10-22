@@ -87,6 +87,7 @@ public:
     void init(int sockfd, const sockaddr_in &addr, char *, int, int, string user, string passwd, string sqlname);
     void close_conn(bool real_close = true);
     void process();
+    HTTP_CODE process_read();  // 移至公有，供协程模式使用
     bool read_once();
     bool write();
     sockaddr_in *get_address()
@@ -126,10 +127,19 @@ public:
         }
     }
 
+    // 协程文件上传支持
+    METHOD get_method() const { return m_method; }
+    const char* get_url() const { return m_url; }
+    long get_content_length() const { return m_content_length; }
+    const char* get_read_buffer_const() const { return m_read_buf; }
+    long get_read_idx_const() const { return m_read_idx; }
+
+    // 协程文件下载支持
+    const char* get_header(const char* header_name) const;
+
 
 private:
     void init();
-    HTTP_CODE process_read();
     bool process_write(HTTP_CODE ret);
     HTTP_CODE parse_request_line(char *text);
     HTTP_CODE parse_headers(char *text);

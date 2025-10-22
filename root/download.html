@@ -1,0 +1,229 @@
+<!DOCTYPE html>
+<html>
+    <head>
+        <meta charset="UTF-8">
+        <title>文件下载 - TinyWebServer</title>
+        <style>
+            * {
+                margin: 0;
+                padding: 0;
+                box-sizing: border-box;
+            }
+
+            body {
+                font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                min-height: 100vh;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                padding: 20px;
+            }
+
+            .container {
+                background: white;
+                padding: 40px;
+                border-radius: 15px;
+                box-shadow: 0 10px 40px rgba(0,0,0,0.2);
+                max-width: 800px;
+                width: 100%;
+            }
+
+            h1 {
+                color: #333;
+                margin-bottom: 10px;
+                text-align: center;
+            }
+
+            .subtitle {
+                text-align: center;
+                color: #666;
+                margin-bottom: 30px;
+                font-size: 14px;
+            }
+
+            .file-list {
+                margin-bottom: 30px;
+            }
+
+            .file-item {
+                display: flex;
+                align-items: center;
+                justify-content: space-between;
+                padding: 15px;
+                margin-bottom: 10px;
+                border: 2px solid #f0f0f0;
+                border-radius: 8px;
+                transition: all 0.3s;
+                background: #fafafa;
+            }
+
+            .file-item:hover {
+                border-color: #667eea;
+                background: #f5f7ff;
+                transform: translateX(5px);
+            }
+
+            .file-info {
+                display: flex;
+                align-items: center;
+                flex: 1;
+            }
+
+            .file-icon {
+                font-size: 32px;
+                margin-right: 15px;
+            }
+
+            .file-details {
+                flex: 1;
+            }
+
+            .file-name {
+                font-weight: bold;
+                color: #333;
+                margin-bottom: 5px;
+            }
+
+            .file-size {
+                color: #999;
+                font-size: 12px;
+            }
+
+            .download-btn {
+                padding: 10px 20px;
+                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                color: white;
+                border: none;
+                border-radius: 8px;
+                font-weight: bold;
+                cursor: pointer;
+                transition: all 0.3s;
+                text-decoration: none;
+                display: inline-block;
+            }
+
+            .download-btn:hover {
+                transform: translateY(-2px);
+                box-shadow: 0 5px 15px rgba(102, 126, 234, 0.4);
+            }
+
+            .back-btn {
+                display: block;
+                width: 100%;
+                padding: 15px;
+                background: #f0f0f0;
+                color: #333;
+                border: none;
+                border-radius: 8px;
+                font-size: 16px;
+                font-weight: bold;
+                cursor: pointer;
+                text-decoration: none;
+                text-align: center;
+                transition: all 0.3s;
+            }
+
+            .back-btn:hover {
+                background: #e0e0e0;
+            }
+
+            .empty-message {
+                text-align: center;
+                padding: 40px;
+                color: #999;
+            }
+
+            .loading {
+                text-align: center;
+                padding: 40px;
+                color: #667eea;
+            }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <h1>📥 文件下载中心</h1>
+            <p class="subtitle">支持断点续传 | 高速下载 | 自动校验</p>
+
+            <div class="file-list" id="fileList">
+                <div class="loading">正在加载文件列表...</div>
+            </div>
+
+            <a href="/" class="back-btn">返回首页</a>
+        </div>
+
+        <script>
+            // 文件图标映射
+            function getFileIcon(filename) {
+                const ext = filename.split('.').pop().toLowerCase();
+                const iconMap = {
+                    'pdf': '📄',
+                    'doc': '📝', 'docx': '📝',
+                    'xls': '📊', 'xlsx': '📊',
+                    'ppt': '📊', 'pptx': '📊',
+                    'txt': '📃',
+                    'zip': '📦', 'rar': '📦', 'tar': '📦', 'gz': '📦',
+                    'jpg': '🖼️', 'jpeg': '🖼️', 'png': '🖼️', 'gif': '🖼️',
+                    'mp3': '🎵', 'wav': '🎵',
+                    'mp4': '🎬', 'avi': '🎬', 'mov': '🎬',
+                    'html': '🌐', 'htm': '🌐',
+                    'js': '📜', 'css': '📜', 'json': '📜',
+                };
+                return iconMap[ext] || '📁';
+            }
+
+            // 格式化文件大小
+            function formatFileSize(bytes) {
+                if (bytes === 0) return '0 B';
+                const k = 1024;
+                const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
+                const i = Math.floor(Math.log(bytes) / Math.log(k));
+                return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+            }
+
+            // 模拟文件列表（实际应该从服务器获取）
+            // 这里列出一些常见的测试文件
+            const files = [
+                { name: '未就业证明.pdf', size: 2457600 },
+                { name: '20240717资料分析第一讲.mp4', size: 1610612736 },
+                { name: 'test_medium.bin', size: 1945 },
+                { name: 'test_upload.txt', size: 512 }
+            ];
+
+            function renderFileList() {
+                const fileListElement = document.getElementById('fileList');
+
+                if (files.length === 0) {
+                    fileListElement.innerHTML = '<div class="empty-message">暂无可下载的文件</div>';
+                    return;
+                }
+
+                fileListElement.innerHTML = '';
+
+                files.forEach(file => {
+                    const fileItem = document.createElement('div');
+                    fileItem.className = 'file-item';
+
+                    fileItem.innerHTML = `
+                        <div class="file-info">
+                            <div class="file-icon">${getFileIcon(file.name)}</div>
+                            <div class="file-details">
+                                <div class="file-name">${file.name}</div>
+                                <div class="file-size">${formatFileSize(file.size)}</div>
+                            </div>
+                        </div>
+                        <a href="/download/${file.name}" class="download-btn">下载</a>
+                    `;
+
+                    fileListElement.appendChild(fileItem);
+                });
+            }
+
+            // 页面加载完成后渲染文件列表
+            window.addEventListener('DOMContentLoaded', () => {
+                setTimeout(renderFileList, 500);  // 模拟加载延迟
+            });
+        </script>
+    </body>
+</html>

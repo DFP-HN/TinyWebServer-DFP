@@ -940,12 +940,12 @@ bool http_conn::add_headers(int content_len)
 
 bool http_conn::add_content_length(int content_len)
 {
-    return add_response("Content-Length:%d\r\n", content_len);
+    return add_response("Content-Length: %d\r\n", content_len);
 }
 
 bool http_conn::add_content_type()
 {
-    return add_response("Content-Type:%s\r\n", "text/html");
+    return add_response("Content-Type: %s\r\n", "text/html");
 }
 
 // 根据文件扩展名获取MIME类型
@@ -992,7 +992,7 @@ const char* http_conn::get_mime_type(const char* filename)
 bool http_conn::add_content_type_auto()
 {
     const char* mime_type = get_mime_type(m_real_file);
-    return add_response("Content-Type:%s\r\n", mime_type);
+    return add_response("Content-Type: %s\r\n", mime_type);
 }
 
 bool http_conn::add_linger()
@@ -1020,12 +1020,12 @@ bool http_conn::add_content(const char *content)
 
 bool http_conn::add_etag(const char *etag)
 {
-    return add_response("ETag:%s\r\n", etag);
+    return add_response("ETag: %s\r\n", etag);
 }
 
 bool http_conn::add_cache_control(const char *directive)
 {
-    return add_response("Cache-Control:%s\r\n", directive);
+    return add_response("Cache-Control: %s\r\n", directive);
 }
 
 bool http_conn::process_write(HTTP_CODE ret)
@@ -1144,4 +1144,53 @@ void http_conn::process()
     {
         m_epoll_manager->modfd(m_sockfd, EPOLLOUT, m_TRIGMode);
     }
+}
+
+/**
+ * @brief 获取指定的 HTTP 请求头
+ *
+ * @param header_name 请求头名称（如 "Range", "Host"）
+ * @return 请求头的值（指向内部缓冲区），如果未找到返回 nullptr
+ *
+ * 注意：返回的指针指向内部缓冲区，使用时需要小心
+ */
+const char* http_conn::get_header(const char* header_name) const
+{
+    if (!header_name || !m_read_buf) {
+        return nullptr;
+    }
+
+    // 查找请求头结束位置（空行）
+    const char* header_end = strstr(m_read_buf, "\r\n\r\n");
+    if (!header_end) {
+        return nullptr;
+    }
+
+    // 构建搜索模式："\r\nHeader-Name: "
+    char search_pattern[256];
+    snprintf(search_pattern, sizeof(search_pattern), "\r\n%s:", header_name);
+
+    // 从第一行之后开始搜索（跳过请求行）
+    const char* first_line_end = strstr(m_read_buf, "\r\n");
+    if (!first_line_end) {
+        return nullptr;
+    }
+
+    const char* found = strstr(first_line_end, search_pattern);
+    if (!found || found >= header_end) {
+        // 未找到，或者找到的位置在请求体中
+        return nullptr;
+    }
+
+    // 跳过 "\r\nHeader-Name: "
+    const char* value_start = found + strlen(search_pattern);
+
+    // 跳过前导空格
+    while (*value_start == ' ' || *value_start == '\t') {
+        value_start++;
+    }
+
+    // 返回值的起始位置
+    // 注意：值以 \r\n 结尾，调用者需要自行处理
+    return value_start;
 }

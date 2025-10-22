@@ -5,6 +5,10 @@
 #include "coroutine/task.h"
 #include "coroutine/io_awaiter.h"
 #include "coroutine/scheduler.h"
+#include "coroutine/advanced_file_upload.h"
+#include "coroutine/advanced_file_download.h"
+#include "http/resumable_upload.h"
+#include "http/http_range.h"
 #endif
 
 WebServer::WebServer()
@@ -575,14 +579,348 @@ Task<void> WebServer::handle_http_connection_coro(int connfd, struct sockaddr_in
                 adjust_timer(timer_obj);
             }
 
-            // 3. 解析和处理 HTTP 请求
+            // 3. 解析HTTP请求
             LOG_DEBUG("Coroutine: processing HTTP request for fd=%d", connfd);
-            conn->process();
 
-            // 4. 检查是否有响应需要发送
-            if (conn->get_bytes_to_send() == 0) {
-                LOG_WARN("No response to send for fd=%d", connfd);
-                break;
+            // 3.1 先检查是否可能是文件上传请求（通过简单的缓冲区扫描）
+            const char* read_buf = conn->get_read_buffer_const();
+            bool is_upload_request = false;
+            std::string content_type_saved;  // 保存Content-Type
+
+            // 快速检查：是否是 POST /upload
+            if (strstr(read_buf, "POST /upload HTTP") != nullptr &&
+                strstr(read_buf, "multipart/form-data") != nullptr) {
+                is_upload_request = true;
+
+                // 在调用process_read()之前提取Content-Type
+                const char* ct_ptr = strstr(read_buf, "Content-Type:");
+                const char* header_end = strstr(read_buf, "\r\n\r\n");
+
+                if (ct_ptr && header_end && ct_ptr < header_end) {
+                    ct_ptr += 13;  // strlen("Content-Type:")
+                    while (*ct_ptr == ' ') ct_ptr++;
+
+                    const char* line_end = strstr(ct_ptr, "\r\n");
+                    if (line_end) {
+                        content_type_saved = std::string(ct_ptr, line_end - ct_ptr);
+                        LOG_DEBUG("Extracted Content-Type before parse: %s", content_type_saved.c_str());
+                    }
+                }
+            }
+
+            if (is_upload_request) {
+                // 直接从缓冲区提取 Content-Length，不调用 process_read()
+                // 因为 process_read() 是为传统 epoll 模式设计的，会破坏协程模式的状态
+                size_t content_length = 0;
+                const char* cl_ptr = strstr(read_buf, "Content-Length:");
+                const char* header_end = strstr(read_buf, "\r\n\r\n");
+
+                if (cl_ptr && header_end && cl_ptr < header_end) {
+                    cl_ptr += 15;  // strlen("Content-Length:")
+                    while (*cl_ptr == ' ' || *cl_ptr == '\t') cl_ptr++;
+                    content_length = atoll(cl_ptr);
+
+                    if (content_length == 0) {
+                        LOG_ERROR("Invalid Content-Length value for fd=%d", connfd);
+                        break;
+                    }
+
+                    fprintf(stderr, "[DEBUG] Before LOG_INFO 1, content_length=%zu\n", content_length);
+                    fflush(stderr);
+                    LOG_INFO("Detected file upload: Content-Length=%zu", content_length);
+                    fprintf(stderr, "[DEBUG] After LOG_INFO 1, before LOG_INFO 2\n");
+                    fflush(stderr);
+                    LOG_INFO("Content-Type: %s", content_type_saved.c_str());
+                    fprintf(stderr, "[DEBUG] After LOG_INFO 2\n");
+                    fflush(stderr);
+                } else {
+                    LOG_ERROR("Invalid upload request: missing Content-Length for fd=%d", connfd);
+                    break;
+                }
+
+                fprintf(stderr, "[DEBUG] Entering upload logic block\n");
+                fflush(stderr);
+
+                if (!content_type_saved.empty() && content_length > 0) {
+                    fprintf(stderr, "[DEBUG] Calculating header/body sizes\n");
+                    fflush(stderr);
+
+                    // 计算请求头的长度
+                    size_t header_length = (header_end + 4) - read_buf;
+                    size_t total_read = conn->get_read_idx();
+
+                    fprintf(stderr, "[DEBUG] header_length=%zu, total_read=%zu\n", header_length, total_read);
+                    fflush(stderr);
+
+                    LOG_INFO("Header length: %zu, Total read: %zu", header_length, total_read);
+
+                    // 计算已读取的请求体部分（防止整数下溢）
+                    size_t body_already_read = 0;
+                    if (total_read > header_length) {
+                        body_already_read = total_read - header_length;
+                    } else {
+                        LOG_WARN("total_read (%zu) <= header_length (%zu), setting body_already_read=0",
+                                 total_read, header_length);
+                    }
+
+                    LOG_INFO("Starting file upload: header=%zu bytes, body_read=%zu/%zu bytes",
+                             header_length, body_already_read, content_length);
+
+                    // 配置上传参数
+                    AdvancedUploadConfig upload_config;
+                    upload_config.enable_md5 = true;
+                    upload_config.enable_sha256 = false;
+                    upload_config.enable_resume = false;  // 暂时禁用续传
+                    upload_config.max_file_size = 2ULL * 1024 * 1024 * 1024; // 2GB
+                    upload_config.chunk_size = 128 * 1024; // 128KB
+
+                    // 进度回调
+                    auto progress_cb = [connfd](const UploadProgress& progress) {
+                        static int last_percent = -1;
+                        int current_percent = (int)progress.percentage;
+                        if (current_percent % 10 == 0 && current_percent != last_percent) {
+                            LOG_INFO("[fd=%d] Upload progress: %.1f%% (%zu/%zu bytes, %.2f MB/s)",
+                                     connfd, progress.percentage,
+                                     progress.bytes_uploaded, progress.total_bytes,
+                                     progress.upload_rate / (1024.0 * 1024.0));
+                            last_percent = current_percent;
+                        }
+                    };
+
+                    // 调用协程文件上传处理器
+                    // ⚠️ 重要：必须复制 prebuffer 数据到独立缓冲区！
+                    // 因为协程挂起时，conn 的缓冲区可能被修改，导致内存访问错误
+                    std::string prebuffer_copy;
+                    if (body_already_read > 0) {
+                        const char* prebuffer_start = read_buf + header_length;
+                        prebuffer_copy.assign(prebuffer_start, body_already_read);
+                        fprintf(stderr, "[DEBUG] Copied %zu bytes to prebuffer_copy\n", prebuffer_copy.size());
+                        fflush(stderr);
+                    }
+
+                    fprintf(stderr, "[DEBUG] Before co_await handle_advanced_file_upload, prebuffer_len=%zu\n", prebuffer_copy.size());
+                    fflush(stderr);
+
+                    AdvancedUploadResult upload_result = co_await handle_advanced_file_upload(
+                        connfd,
+                        m_io_uring_manager.get(),
+                        content_type_saved.c_str(),
+                        content_length,
+                        upload_config,
+                        progress_cb,
+                        prebuffer_copy.empty() ? nullptr : prebuffer_copy.data(),  // 使用副本
+                        prebuffer_copy.size()   // 已读取的字节数
+                    );
+
+                    fprintf(stderr, "[DEBUG] After co_await handle_advanced_file_upload, success=%d\n", upload_result.success);
+                    fflush(stderr);
+
+                    if (upload_result.success) {
+                        LOG_INFO("File upload completed: %s (%zu bytes, %.2fs)",
+                                 upload_result.filename.c_str(),
+                                 upload_result.bytes_uploaded,
+                                 upload_result.upload_time_seconds);
+                    } else {
+                        LOG_ERROR("File upload failed: %s", upload_result.error_message.c_str());
+                    }
+
+                    // 上传处理完成，重置连接
+                    conn->reset_connection();
+
+                    // 根据是否Keep-Alive决定是否继续
+                    if (!conn->get_linger()) {
+                        break;
+                    }
+                    continue;  // 继续处理下一个请求
+                } else {
+                    LOG_ERROR("Invalid upload request: empty Content-Type or zero length for fd=%d", connfd);
+                    break;
+                }
+            } else {
+                // 3.2 先检查是否是文件下载请求（在调用 process() 之前）
+                // 快速检查：是否是 "GET /download/"
+                fprintf(stderr, "[DEBUG] Checking for download request, read_buf first 100 chars: %.100s\n", read_buf);
+                fflush(stderr);
+
+                bool is_download_request = false;
+                if (strstr(read_buf, "GET /download/") != nullptr) {
+                    is_download_request = true;
+                    fprintf(stderr, "[DEBUG] Download request detected!\n");
+                    fflush(stderr);
+                }
+
+                fprintf(stderr, "[DEBUG] is_download_request = %d\n", is_download_request);
+                fflush(stderr);
+
+                if (is_download_request) {
+                    // 3.3 文件下载请求（协程处理）
+                    // 直接从缓冲区提取 URL，不调用 process_read()（会返回 NO_RESOURCE）
+                    fprintf(stderr, "[DEBUG] Extracting URL from buffer for download request\n");
+                    fflush(stderr);
+
+                    // 手动解析 URL：GET /download/filename HTTP/1.1
+                    const char* url_start = strstr(read_buf, "GET ");
+                    if (!url_start) {
+                        LOG_ERROR("Invalid GET request for fd=%d", connfd);
+                        break;
+                    }
+                    url_start += 4;  // 跳过 "GET "
+
+                    const char* url_end = strstr(url_start, " HTTP/");
+                    if (!url_end) {
+                        LOG_ERROR("Invalid HTTP request line for fd=%d", connfd);
+                        break;
+                    }
+
+                    // 提取 URL
+                    char url_buffer[256];
+                    size_t url_len = url_end - url_start;
+                    if (url_len >= sizeof(url_buffer)) {
+                        LOG_ERROR("URL too long for fd=%d", connfd);
+                        break;
+                    }
+                    memcpy(url_buffer, url_start, url_len);
+                    url_buffer[url_len] = '\0';
+
+                    fprintf(stderr, "[DEBUG] Extracted URL: %s\n", url_buffer);
+                    fflush(stderr);
+
+                    // 检查 URL 是否以 /download/ 开头
+                    if (strncmp(url_buffer, "/download/", 10) != 0) {
+                        LOG_ERROR("Invalid download URL for fd=%d: %s", connfd, url_buffer);
+                        break;
+                    }
+
+                    // 提取文件名（URL 编码）
+                    const char* filename_encoded = url_buffer + 10;  // 跳过 "/download/"
+
+                    // URL 解码文件名
+                    char filename_decoded[256];
+                    size_t decoded_len = 0;
+                    const char* p = filename_encoded;
+
+                    while (*p && decoded_len < sizeof(filename_decoded) - 1) {
+                        if (*p == '%' && p[1] && p[2]) {
+                            // 解码 %XX
+                            int hex_value = 0;
+                            char hex_str[3] = {p[1], p[2], '\0'};
+                            if (sscanf(hex_str, "%x", &hex_value) == 1) {
+                                filename_decoded[decoded_len++] = (char)hex_value;
+                                p += 3;
+                            } else {
+                                filename_decoded[decoded_len++] = *p++;
+                            }
+                        } else if (*p == '+') {
+                            // '+' 解码为空格
+                            filename_decoded[decoded_len++] = ' ';
+                            p++;
+                        } else {
+                            filename_decoded[decoded_len++] = *p++;
+                        }
+                    }
+                    filename_decoded[decoded_len] = '\0';
+
+                    fprintf(stderr, "[DEBUG] Decoded filename: %s\n", filename_decoded);
+                    fflush(stderr);
+
+                    // 构建完整文件路径
+                    char file_path[512];
+                    snprintf(file_path, sizeof(file_path), "./root/uploads/%s", filename_decoded);
+
+                    fprintf(stderr, "[DEBUG] Download file path: %s\n", file_path);
+                    fflush(stderr);
+
+                    // 解析 Range 请求头（如果有）
+                    HttpRange range;
+                    const char* range_header = conn->get_header("Range");
+
+                    if (range_header) {
+                        fprintf(stderr, "[DEBUG] Range header found: %s\n", range_header);
+                        fflush(stderr);
+
+                        // 获取文件大小以验证 Range
+                        struct stat file_stat;
+                        if (stat(file_path, &file_stat) == 0) {
+                            // 需要复制 range_header 内容到独立字符串，因为以 \r\n 结尾
+                            char range_value[256];
+                            const char* value_end = strstr(range_header, "\r\n");
+                            if (value_end) {
+                                size_t value_len = value_end - range_header;
+                                if (value_len < sizeof(range_value)) {
+                                    memcpy(range_value, range_header, value_len);
+                                    range_value[value_len] = '\0';
+
+                                    if (!range.parse_range_header(range_value, file_stat.st_size)) {
+                                        LOG_WARN("Invalid Range header: %s", range_value);
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // 配置下载参数
+                    AdvancedDownloadConfig download_config;
+                    download_config.enable_rate_limit = false;
+                    download_config.chunk_size = 128 * 1024;  // 128KB
+                    download_config.progress_interval = 1 * 1024 * 1024;  // 1MB
+
+                    // 进度回调
+                    auto progress_cb = [connfd](const DownloadProgress& progress) {
+                        static int last_percent = -1;
+                        int current_percent = (int)progress.percentage;
+                        if (current_percent % 10 == 0 && current_percent != last_percent) {
+                            LOG_INFO("[fd=%d] Download progress: %.1f%% (%zu/%zu bytes, %.2f MB/s)",
+                                     connfd, progress.percentage,
+                                     progress.bytes_sent, progress.total_bytes,
+                                     progress.download_rate / (1024.0 * 1024.0));
+                            last_percent = current_percent;
+                        }
+                    };
+
+                    fprintf(stderr, "[DEBUG] Before co_await handle_advanced_file_download\n");
+                    fflush(stderr);
+
+                    // 调用协程文件下载处理器
+                    AdvancedDownloadResult download_result = co_await handle_advanced_file_download(
+                        connfd,
+                        m_io_uring_manager.get(),
+                        file_path,
+                        download_config,
+                        progress_cb,
+                        range.is_range_request ? &range : nullptr
+                    );
+
+                    fprintf(stderr, "[DEBUG] After co_await handle_advanced_file_download, success=%d\n",
+                            download_result.success);
+                    fflush(stderr);
+
+                    if (download_result.success) {
+                        LOG_INFO("File download completed: %s (%zu bytes, %.2fs)",
+                                 download_result.filename.c_str(),
+                                 download_result.bytes_sent,
+                                 download_result.download_time_seconds);
+                    } else {
+                        LOG_ERROR("File download failed: %s", download_result.error_message.c_str());
+                    }
+
+                    // 下载处理完成，重置连接
+                    conn->reset_connection();
+
+                    // 根据是否 Keep-Alive 决定是否继续
+                    if (!conn->get_linger()) {
+                        break;
+                    }
+                    continue;  // 继续处理下一个请求
+                } else {
+                    // 3.4 对于非下载请求，调用完整的 process() 处理
+                    conn->process();
+
+                    // 4. 检查是否有响应需要发送
+                    if (conn->get_bytes_to_send() == 0) {
+                        LOG_WARN("No response to send for fd=%d", connfd);
+                        break;
+                    }
+                }
             }
 
             // 5. 发送响应
