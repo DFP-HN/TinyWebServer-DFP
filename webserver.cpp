@@ -5,11 +5,17 @@
 #include "coroutine/task.h"
 #include "coroutine/io_awaiter.h"
 #include "coroutine/scheduler.h"
+#include "coroutine/advanced_scheduler.h"
+#include "coroutine/thread_pool_bridge.h"
+#include "coroutine/cpu_task.h"
 #include "coroutine/advanced_file_upload.h"
 #include "coroutine/advanced_file_download.h"
 #include "coroutine/advanced_file_delete.h"
 #include "coroutine/file_list_api.h"
 #include "coroutine/file_search_api.h"
+#include "threadpool/cpu_thread_pool.h"
+#include "scheduler/task_dispatcher.h"
+#include "monitor/coro_monitor.h"
 #include "http/resumable_upload.h"
 #include "http/http_range.h"
 #endif
@@ -95,6 +101,23 @@ void WebServer::init(int port, string user, string passWord, string databaseName
             {
 #ifdef USE_COROUTINE
                 LOG_INFO("io_uring initialized successfully (coroutine style)");
+
+                // 创建CPU线程池（线程数=CPU核心数的一半，避免过度竞争）
+                size_t cpu_threads = std::thread::hardware_concurrency() / 2;
+                if (cpu_threads < 2) cpu_threads = 2;
+                if (cpu_threads > 8) cpu_threads = 8;  // 最多8个线程
+
+                m_cpu_thread_pool = std::make_unique<CpuThreadPool>(cpu_threads, 1000);
+                LOG_INFO("CPU thread pool created: %zu threads", cpu_threads);
+
+                // 创建任务分发器
+                m_task_dispatcher = std::make_unique<TaskDispatcher>();
+                LOG_INFO("Task dispatcher created");
+
+                // 创建增强型协程调度器（最多10000个并发协程）
+                m_coro_scheduler = std::make_unique<AdvancedScheduler>(
+                    m_io_uring_manager.get(), 10000);
+                LOG_INFO("Advanced coroutine scheduler created");
 #else
                 LOG_WARN("Coroutine not compiled, falling back to io_uring callback mode");
                 m_event_loop_mode = IO_URING_MODE;
@@ -585,8 +608,69 @@ Task<void> WebServer::handle_http_connection_coro(int connfd, struct sockaddr_in
             // 3. 解析HTTP请求
             LOG_DEBUG("Coroutine: processing HTTP request for fd=%d", connfd);
 
-            // 3.1 先检查是否可能是文件上传请求（通过简单的缓冲区扫描）
             const char* read_buf = conn->get_read_buffer_const();
+
+            // 3.0 检查是否是CPU密集任务请求（优先级最高）
+            if (m_task_dispatcher && strstr(read_buf, "/cpu_compute") != nullptr) {
+                LOG_INFO("CPU compute request detected for fd=%d", connfd);
+
+                // 解析CPU任务参数
+                char task_name[32] = "mixed";  // 默认任务类型
+                int level = 3;  // 默认级别
+
+                if (parse_cpu_task_params(read_buf, task_name, sizeof(task_name), &level)) {
+                    LOG_INFO("CPU task: type=%s, level=%d", task_name, level);
+
+                    try {
+                        // 在线程池执行CPU计算（不阻塞协程）
+                        std::string result = co_await dispatch_cpu_task(
+                            task_name, level, m_io_uring_manager.get()
+                        );
+
+                        // 构造HTTP响应
+                        std::string response =
+                            "HTTP/1.1 200 OK\r\n"
+                            "Content-Type: application/json; charset=utf-8\r\n"
+                            "Content-Length: " + std::to_string(result.size()) + "\r\n"
+                            "Connection: close\r\n"
+                            "\r\n" + result;
+
+                        // 异步写入响应
+                        co_await async_write(
+                            m_io_uring_manager.get(), connfd,
+                            response.c_str(), response.size()
+                        );
+
+                        LOG_INFO("CPU task completed: %s level=%d", task_name, level);
+                    } catch (const std::exception& e) {
+                        LOG_ERROR("CPU task failed: %s", e.what());
+
+                        // 发送错误响应
+                        const char* error_response =
+                            "HTTP/1.1 500 Internal Server Error\r\n"
+                            "Content-Type: text/plain\r\n"
+                            "Content-Length: 20\r\n"
+                            "\r\n"
+                            "CPU task failed\r\n";
+                        co_await async_write(m_io_uring_manager.get(), connfd,
+                                             error_response, strlen(error_response));
+                    }
+                } else {
+                    // 参数解析失败
+                    const char* error_response =
+                        "HTTP/1.1 400 Bad Request\r\n"
+                        "Content-Type: text/plain\r\n"
+                        "Content-Length: 30\r\n"
+                        "\r\n"
+                        "Invalid CPU task parameters\n";
+                    co_await async_write(m_io_uring_manager.get(), connfd,
+                                         error_response, strlen(error_response));
+                }
+
+                break;  // 关闭连接
+            }
+
+            // 3.1 先检查是否可能是文件上传请求（通过简单的缓冲区扫描）
             bool is_upload_request = false;
             std::string content_type_saved;  // 保存Content-Type
 
@@ -1232,10 +1316,8 @@ Task<void> WebServer::handle_http_connection_coro(int connfd, struct sockaddr_in
  *
  * @param scheduler 协程调度器，用于启动新的连接处理协程
  */
-Task<void> WebServer::accept_connections_coro(CoroScheduler* scheduler)
+Task<void> WebServer::accept_connections_coro(AdvancedScheduler* scheduler)
 {
-    fprintf(stderr, "[DEBUG] accept_connections_coro: START, listen_fd=%d\n", m_listenfd);
-    fflush(stderr);
     LOG_INFO("Starting accept coroutine on listen_fd=%d", m_listenfd);
 
     // 分配地址结构（重复使用）
@@ -1250,8 +1332,6 @@ Task<void> WebServer::accept_connections_coro(CoroScheduler* scheduler)
             client_addrlen = sizeof(client_address);
 
             // 异步接受新连接
-            fprintf(stderr, "[DEBUG] accept_connections_coro: Before co_await async_accept\n");
-            fflush(stderr);
             LOG_DEBUG("Accept coroutine: waiting for new connection...");
 
             int connfd = co_await async_accept(
@@ -1261,10 +1341,12 @@ Task<void> WebServer::accept_connections_coro(CoroScheduler* scheduler)
                 &client_addrlen
             );
 
-            fprintf(stderr, "[DEBUG] accept_connections_coro: After co_await, connfd=%d\n", connfd);
-            fflush(stderr);
+            if (connfd < 0) {
+                LOG_ERROR("Accept failed: %d", connfd);
+                continue;
+            }
 
-            LOG_INFO("Accept coroutine: accepted new connection fd=%d from %s:%d",
+            LOG_INFO("Accepted connection fd=%d from %s:%d",
                      connfd,
                      inet_ntoa(client_address.sin_addr),
                      ntohs(client_address.sin_port));
@@ -1278,9 +1360,18 @@ Task<void> WebServer::accept_connections_coro(CoroScheduler* scheduler)
                 continue;
             }
 
-            // 为新连接启动处理协程
-            LOG_DEBUG("Accept coroutine: spawning handler for fd=%d", connfd);
-            scheduler->spawn(handle_http_connection_coro(connfd, client_address));
+            // 为新连接启动处理协程（NORMAL优先级）
+            bool spawned = scheduler->spawn(
+                handle_http_connection_coro(connfd, client_address),
+                CoroutinePriority::NORMAL,
+                "http-handler"
+            );
+
+            if (!spawned) {
+                LOG_ERROR("Failed to spawn handler for fd=%d (scheduler full)", connfd);
+                utils.show_error(connfd, "Server overloaded");
+                close(connfd);
+            }
         }
     }
     catch (const IoError& e) {
@@ -1309,56 +1400,46 @@ Task<void> WebServer::accept_connections_coro(CoroScheduler* scheduler)
  */
 void WebServer::eventLoop_coro()
 {
-    fprintf(stderr, "[DEBUG] eventLoop_coro: START\n");
-    fflush(stderr);
-
     if (!m_io_uring_manager || !m_io_uring_manager->is_initialized())
     {
-        fprintf(stderr, "[DEBUG] io_uring not initialized!\n");
-        fflush(stderr);
         LOG_ERROR("io_uring not initialized, cannot start coroutine event loop");
         return;
     }
 
-    fprintf(stderr, "[DEBUG] Creating scheduler...\n");
-    fflush(stderr);
-    LOG_INFO("Starting coroutine event loop (queue depth=%u)",
+    if (!m_coro_scheduler)
+    {
+        LOG_ERROR("Advanced scheduler not initialized");
+        return;
+    }
+
+    LOG_INFO("Starting advanced coroutine event loop (queue depth=%u)",
              m_io_uring_manager->get_queue_depth());
 
-    // 创建协程调度器
-    LOG_INFO("Creating coroutine scheduler...");
-    CoroScheduler scheduler(m_io_uring_manager.get());
-    fprintf(stderr, "[DEBUG] Scheduler created\n");
-    fflush(stderr);
-    LOG_INFO("Coroutine scheduler created");
+    // 启动 accept 协程（高优先级）
+    bool spawned = m_coro_scheduler->spawn(
+        accept_connections_coro(m_coro_scheduler.get()),
+        CoroutinePriority::HIGH,
+        "accept-loop"
+    );
 
-    // 启动 accept 协程（负责接受新连接）
-    fprintf(stderr, "[DEBUG] Creating accept_connections_coro...\n");
-    fflush(stderr);
-    LOG_INFO("Spawning accept coroutine...");
+    if (!spawned)
+    {
+        LOG_ERROR("Failed to spawn accept coroutine");
+        return;
+    }
 
-    fprintf(stderr, "[DEBUG] Calling accept_connections_coro(&scheduler)...\n");
-    fflush(stderr);
-    auto accept_task = accept_connections_coro(&scheduler);
-    fprintf(stderr, "[DEBUG] accept_connections_coro returned a Task\n");
-    fflush(stderr);
+    LOG_INFO("Accept coroutine spawned with HIGH priority");
 
-    fprintf(stderr, "[DEBUG] Calling scheduler.spawn()...\n");
-    fflush(stderr);
-    scheduler.spawn(std::move(accept_task));
-    fprintf(stderr, "[DEBUG] Accept coroutine spawned\n");
-    fflush(stderr);
-    LOG_INFO("Accept coroutine spawned");
+    // 运行调度器
+    LOG_INFO("Running advanced coroutine scheduler...");
+    m_coro_scheduler->run();
 
-    // 运行事件循环（调度器会自动管理所有协程）
-    fprintf(stderr, "[DEBUG] Running scheduler...\n");
-    fflush(stderr);
-    LOG_INFO("Running coroutine scheduler...");
-    scheduler.run();
-
-    fprintf(stderr, "[DEBUG] Scheduler stopped\n");
-    fflush(stderr);
-    LOG_INFO("Coroutine event loop stopped");
+    // 打印统计信息
+    LOG_INFO("Coroutine event loop stopped, printing statistics:");
+    m_coro_scheduler->print_stats();
+    m_cpu_thread_pool->print_stats();
+    m_task_dispatcher->print_stats();
+    get_global_coro_monitor().print_dashboard();
 }
 #endif  // USE_COROUTINE
 

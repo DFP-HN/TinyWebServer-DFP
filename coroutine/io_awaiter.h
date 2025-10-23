@@ -119,24 +119,44 @@ public:
         coro_handle = handle;
 
         uint64_t user_data = reinterpret_cast<uint64_t>(this);
+        fprintf(stderr, "[IoUringWriteAwaiter] await_suspend: fd=%d, len=%zu, offset=%ld, user_data=%p\n",
+                sockfd, length, (long)offset, (void*)user_data);
+        fflush(stderr);
+
         bool submitted = manager->submit_write(sockfd, buffer, length, offset, user_data);
 
+        fprintf(stderr, "[IoUringWriteAwaiter] submit_write returned: %d\n", submitted);
+        fflush(stderr);
+
         if (!submitted) {
+            fprintf(stderr, "[IoUringWriteAwaiter] Submit failed, setting result=-EAGAIN\n");
+            fflush(stderr);
             result = -EAGAIN;
             handle.resume();
         }
     }
 
     ssize_t await_resume() {
+        fprintf(stderr, "[IoUringWriteAwaiter] await_resume: result=%zd\n", result);
+        fflush(stderr);
+
         if (result < 0) {
+            fprintf(stderr, "[IoUringWriteAwaiter] Throwing IoError: result=%zd\n", result);
+            fflush(stderr);
             throw IoError("async write failed", -result);
         }
         return result;
     }
 
     void complete(int res) {
+        fprintf(stderr, "[IoUringWriteAwaiter] complete called: res=%d, coro_handle=%p\n",
+                res, coro_handle.address());
+        fflush(stderr);
+
         result = res;
         if (coro_handle) {
+            fprintf(stderr, "[IoUringWriteAwaiter] Resuming coroutine\n");
+            fflush(stderr);
             coro_handle.resume();
         }
     }
@@ -257,6 +277,24 @@ inline IoUringAcceptAwaiter async_accept(
 )
 {
     return IoUringAcceptAwaiter(mgr, listen_fd, addr, addrlen);
+}
+
+/**
+ * @brief 异步文件写入（用于文件上传）
+ *
+ * 与async_write的区别：
+ * - async_write 用于socket写入（offset=-1，使用当前位置）
+ * - async_file_write 用于文件写入（支持指定offset，并发写入）
+ */
+inline IoUringWriteAwaiter async_file_write(
+    IoUringManager* mgr,
+    int file_fd,
+    const void* buffer,
+    size_t length,
+    off_t offset
+)
+{
+    return IoUringWriteAwaiter(mgr, file_fd, buffer, length, offset);
 }
 
 #endif // COROUTINE_IO_AWAITER_H

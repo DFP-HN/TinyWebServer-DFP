@@ -202,9 +202,12 @@ private:
     bool m_buffers_registered;         ///< 是否注册了固定缓冲区
     bool m_files_registered;           ///< 是否注册了固定文件描述符
 
+public:
     /**
      * @brief 获取 SQE（提交队列条目）
      * @return SQE 指针，NULL 表示队列满
+     *
+     * 注意：此方法暴露为public以支持协程-线程池桥接中的自定义操作
      */
     struct io_uring_sqe* get_sqe();
 };

@@ -25,7 +25,8 @@ ifeq ($(USE_IO_URING), 1)
 endif
 
 ifeq ($(USE_COROUTINE), 1)
-    SRCS += http/streaming_multipart_parser.cpp
+    SRCS += http/streaming_multipart_parser.cpp \
+            cpu_compute/cpu_intensive.cpp
 endif
 
 server: $(SRCS)

@@ -30,6 +30,9 @@
 // 前向声明
 template<typename T> class Task;
 class CoroScheduler;
+class AdvancedScheduler;
+class CpuThreadPool;
+class TaskDispatcher;
 #endif
 
 const int MAX_FD = 65536;           //最大文件描述符
@@ -73,7 +76,7 @@ public:
 
     // 协程函数
     Task<void> handle_http_connection_coro(int connfd, struct sockaddr_in client_address);
-    Task<void> accept_connections_coro(CoroScheduler* scheduler);
+    Task<void> accept_connections_coro(AdvancedScheduler* scheduler);
 #endif
 
     void timer(int connfd, struct sockaddr_in client_address);
@@ -137,6 +140,13 @@ public:
 
 #ifdef USE_IO_URING
     std::unique_ptr<IoUringManager> m_io_uring_manager;  // io_uring 管理器
+#endif
+
+#ifdef USE_COROUTINE
+    // 协程+线程池混合架构组件
+    std::unique_ptr<AdvancedScheduler> m_coro_scheduler;    // 增强型协程调度器
+    std::unique_ptr<CpuThreadPool> m_cpu_thread_pool;       // CPU任务线程池
+    std::unique_ptr<TaskDispatcher> m_task_dispatcher;      // 智能任务分发器
 #endif
 };
 

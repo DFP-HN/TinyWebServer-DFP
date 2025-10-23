@@ -103,14 +103,28 @@ bool FileDBManager::insert_file(
     // 自动识别文件类型
     std::string file_type = detect_file_type(extension);
 
-    // 构建SQL语句
-    char sql[2048];
+    // 构建SQL语句（支持文件覆盖：如果文件路径已存在，则更新记录）
+    char sql[4096];
     snprintf(sql, sizeof(sql),
         "INSERT INTO files (filename, file_path, file_size, file_hash, "
         "file_type, extension, upload_time, status) "
-        "VALUES ('%s', '%s', %lu, %s, '%s', '%s', NOW(), 1)",
+        "VALUES ('%s', '%s', %lu, %s, '%s', '%s', NOW(), 1) "
+        "ON DUPLICATE KEY UPDATE "
+        "filename = '%s', "
+        "file_size = %lu, "
+        "file_hash = %s, "
+        "file_type = '%s', "
+        "extension = '%s', "
+        "upload_time = NOW(), "
+        "status = 1",
         escaped_filename.c_str(),
         escaped_path.c_str(),
+        file_size,
+        escaped_hash.empty() ? "NULL" : ("'" + escaped_hash + "'").c_str(),
+        file_type.c_str(),
+        escaped_ext.c_str(),
+        // ON DUPLICATE KEY UPDATE 部分
+        escaped_filename.c_str(),
         file_size,
         escaped_hash.empty() ? "NULL" : ("'" + escaped_hash + "'").c_str(),
         file_type.c_str(),
@@ -121,12 +135,18 @@ bool FileDBManager::insert_file(
 
     // 执行SQL
     if (mysql_query(mysql, sql)) {
-        LOG_ERROR("Failed to insert file record: %s", mysql_error(mysql));
+        LOG_ERROR("Failed to insert/update file record: %s", mysql_error(mysql));
         return false;
     }
 
-    LOG_INFO("File record inserted: %s (size=%lu, type=%s)",
-             filename, file_size, file_type.c_str());
+    // 检查是插入还是更新
+    if (mysql_affected_rows(mysql) == 1) {
+        LOG_INFO("File record inserted: %s (size=%lu, type=%s)",
+                 filename, file_size, file_type.c_str());
+    } else {
+        LOG_INFO("File record updated (overwrite): %s (size=%lu, type=%s)",
+                 filename, file_size, file_type.c_str());
+    }
     return true;
 }
 
