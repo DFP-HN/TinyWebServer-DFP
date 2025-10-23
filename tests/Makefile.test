@@ -1,0 +1,103 @@
+# Test Makefile for TinyWebServer
+# 编译和运行所有测试
+
+CXX := g++-10
+CXXFLAGS := -std=c++20 -fcoroutines -Wall -Wextra -g -O0
+INCLUDES := -I.. -I../coroutine -I../http -I../io_uring -I../threadpool -I../scheduler -I../monitor
+LDFLAGS := -lpthread -luring -lmysqlclient
+
+# 检查是否安装了Google Test
+GTEST_INSTALLED := $(shell pkg-config --exists gtest 2>/dev/null && echo yes)
+ifeq ($(GTEST_INSTALLED),yes)
+    CXXFLAGS += -DUSE_GTEST
+    INCLUDES += $(shell pkg-config --cflags gtest)
+    LDFLAGS += $(shell pkg-config --libs gtest)
+else
+    $(info Google Test not found, using simple test framework)
+endif
+
+# 源文件
+PROJECT_SRCS := \
+    ../log/log.cpp \
+    ../CGImysql/sql_connection_pool.cpp \
+    ../http/http_conn.cpp \
+    ../http/file_db_manager.cpp \
+    ../http/zero_copy.cpp \
+    ../io_uring/io_uring_manager.cpp \
+    ../cpu_compute/cpu_intensive.cpp \
+    ../epoll/epoll_manager.cpp \
+    ../user/user_manager.cpp \
+    ../cache/static_cache.cpp
+
+# 测试文件
+TEST_SRCS := \
+    unit/coroutine/task_test.cpp \
+    unit/coroutine/scheduler_test.cpp \
+    unit/threadpool/cpu_thread_pool_test.cpp \
+    unit/http/file_db_manager_test.cpp
+
+# 所有测试的可执行文件
+TEST_TARGETS := $(TEST_SRCS:.cpp=)
+
+.PHONY: all clean test test-unit test-integration test-performance help
+
+all: $(TEST_TARGETS)
+
+# 通用测试编译规则
+%_test: %_test.cpp
+	@echo "Building test: $<"
+	$(CXX) $(CXXFLAGS) $(INCLUDES) -o $@ $< $(PROJECT_SRCS) $(LDFLAGS)
+
+# 单元测试
+test-unit: unit/coroutine/task_test unit/coroutine/scheduler_test unit/threadpool/cpu_thread_pool_test
+	@echo "Running unit tests..."
+	@for test in $^; do \
+		echo ""; \
+		echo "========================================"; \
+		echo "Running: $$test"; \
+		echo "========================================"; \
+		./$$test || exit 1; \
+	done
+	@echo ""
+	@echo "All unit tests passed!"
+
+# 集成测试
+test-integration:
+	@echo "Running integration tests..."
+	@# TODO: Add integration tests
+
+# 性能测试
+test-performance:
+	@echo "Running performance tests..."
+	@# TODO: Add performance tests
+
+# 运行所有测试
+test: test-unit
+	@echo ""
+	@echo "========================================="
+	@echo "All tests passed successfully!"
+	@echo "========================================="
+
+# 清理
+clean:
+	@echo "Cleaning test binaries..."
+	@find . -type f -executable -name "*_test" -delete
+	@echo "Clean complete."
+
+# 帮助信息
+help:
+	@echo "TinyWebServer Test Suite"
+	@echo ""
+	@echo "Targets:"
+	@echo "  all                - Build all tests"
+	@echo "  test               - Run all tests"
+	@echo "  test-unit          - Run unit tests only"
+	@echo "  test-integration   - Run integration tests"
+	@echo "  test-performance   - Run performance tests"
+	@echo "  clean              - Remove all test binaries"
+	@echo "  help               - Show this help message"
+	@echo ""
+	@echo "Environment:"
+	@echo "  CXX=$(CXX)"
+	@echo "  CXXFLAGS=$(CXXFLAGS)"
+	@echo "  GTEST_INSTALLED=$(GTEST_INSTALLED)"

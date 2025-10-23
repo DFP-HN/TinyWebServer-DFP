@@ -125,6 +125,13 @@ public:
     }
 
     /**
+     * @brief 获取底层的协程句柄（用于测试）
+     */
+    handle_type get_handle() const {
+        return handle;
+    }
+
+    /**
      * @brief 使 Task 可以作为 Awaitable
      */
     bool await_ready() const noexcept {
@@ -243,6 +250,20 @@ public:
         if (handle.promise().exception) {
             std::rethrow_exception(handle.promise().exception);
         }
+    }
+
+    /**
+     * @brief 获取协程结果（void版本的别名）
+     */
+    void get_result_void() {
+        get_result();
+    }
+
+    /**
+     * @brief 获取底层的协程句柄（用于测试）
+     */
+    handle_type get_handle() const {
+        return handle;
     }
 
     /**

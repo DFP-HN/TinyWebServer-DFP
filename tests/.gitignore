@@ -1,0 +1,12 @@
+# 测试二进制文件
+*_test
+!*_test.cpp
+
+# 构建日志
+*.log
+
+# 第三方库
+third_party/
+
+# 临时目录
+tests/
