@@ -25,9 +25,6 @@ int main(int argc, char *argv[])
     //数据库
     server.sql_pool();
 
-    //线程池
-    server.thread_pool();
-
     //触发模式
     server.trig_mode();
 
@@ -59,10 +56,11 @@ int main(int argc, char *argv[])
     else
 #endif
     {
-        fprintf(stderr, "[DEBUG] main: Entering EPOLL_MODE\n");
+        fprintf(stderr, "[ERROR] main: Invalid event_loop_mode or mode not compiled\n");
+        fprintf(stderr, "[ERROR] main: Please use COROUTINE_MODE (2) or IO_URING_MODE (1)\n");
         fflush(stderr);
-        LOG_INFO("Using epoll event loop (traditional)");
-        server.eventLoop();
+        LOG_ERROR("Invalid event loop mode: %d", config.event_loop_mode);
+        return 1;
     }
 
     fprintf(stderr, "[DEBUG] main: Event loop returned\n");

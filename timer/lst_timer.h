@@ -4,7 +4,6 @@
 #include <unistd.h>
 #include <signal.h>
 #include <sys/types.h>
-#include <sys/epoll.h>
 #include <fcntl.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -28,7 +27,6 @@
 #include "../log/log.h"
 
 class util_timer;
-class EpollManager;
 class UserManager;
 
 struct client_data
@@ -38,9 +36,8 @@ struct client_data
     std::shared_ptr<util_timer> timer;  // 使用智能指针管理定时器
 };
 
-// 定时器回调函数类型
-// 使用依赖注入的方式，移除全局静态变量访问
-typedef void (*timer_callback)(client_data *user_data, EpollManager *epoll_mgr, UserManager *user_mgr);
+// 定时器回调函数类型（移除EpollManager依赖）
+typedef void (*timer_callback)(client_data *user_data, UserManager *user_mgr);
 
 class util_timer
 {
@@ -56,7 +53,6 @@ public:
     std::shared_ptr<util_timer> next;  // 使用智能指针
 
     // 保存依赖注入的指针
-    EpollManager *epoll_manager;
     UserManager *user_manager;
 };
 
@@ -112,7 +108,7 @@ private:
     std::unordered_map<util_timer*, size_t> m_timer_pos;        // 快速索引
 };
 
-// 重构后的Utils类 - 移除静态成员
+// 重构后的Utils类 - 移除epoll依赖
 class Utils
 {
 public:
@@ -122,7 +118,6 @@ public:
     void init(int timeslot);
 
     // 依赖注入
-    void set_epoll_manager(EpollManager *epoll_mgr);
     void set_signal_pipe(int *pipefd);
 
     // 信号处理函数 - 改为非静态
@@ -142,11 +137,10 @@ public:
 
 private:
     int *m_pipefd;              // 依赖注入的管道fd
-    EpollManager *m_epoll_manager; // 依赖注入的epoll管理器
 };
 
-// 重构后的回调函数
-void cb_func(client_data *user_data, EpollManager *epoll_mgr, UserManager *user_mgr);
+// 重构后的回调函数（移除EpollManager依赖）
+void cb_func(client_data *user_data, UserManager *user_mgr);
 
 // 设置全局Utils实例（用于信号处理）
 void set_global_utils_instance(Utils *utils);

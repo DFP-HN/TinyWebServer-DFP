@@ -5,7 +5,6 @@
 #include <fstream>
 
 // 引入新的管理器类
-#include "../epoll/epoll_manager.h"
 #include "../user/user_manager.h"
 #include "../cache/static_cache.h"
 
@@ -25,7 +24,7 @@ const char *error_500_form = "There was an unusual problem serving the request f
 
 // 构造函数
 http_conn::http_conn()
-    : m_epoll_manager(nullptr), m_user_manager(nullptr), m_static_cache(nullptr),
+    : m_user_manager(nullptr), m_static_cache(nullptr),
       m_file_buffer(nullptr)
 {
 }
@@ -34,12 +33,6 @@ http_conn::http_conn()
 http_conn::~http_conn()
 {
     clear_file_buffer();
-}
-
-// 依赖注入：设置 EpollManager
-void http_conn::set_epoll_manager(EpollManager *epoll_mgr)
-{
-    m_epoll_manager = epoll_mgr;
 }
 
 // 依赖注入：设置 UserManager
@@ -113,12 +106,8 @@ void http_conn::close_conn(bool real_close)
     {
         printf("close %d\n", m_sockfd);
 
-        // 使用 EpollManager 移除 fd
-        if (m_epoll_manager)
-        {
-            m_epoll_manager->removefd(m_sockfd);
-        }
-
+        // 直接关闭socket（不再使用epoll）
+        close(m_sockfd);
         m_sockfd = -1;
 
         // 使用 UserManager 减少用户计数
@@ -135,12 +124,6 @@ void http_conn::init(int sockfd, const sockaddr_in &addr, char *root, int TRIGMo
 {
     m_sockfd = sockfd;
     m_address = addr;
-
-    // 使用 EpollManager 添加 fd
-    if (m_epoll_manager)
-    {
-        m_epoll_manager->addfd(sockfd, true, TRIGMode);
-    }
 
     // 使用 UserManager 增加用户计数
     if (m_user_manager)
@@ -736,11 +719,6 @@ bool http_conn::write()
 
     if (bytes_to_send == 0)
     {
-        // 使用 EpollManager 修改 fd 事件
-        if (m_epoll_manager)
-        {
-            m_epoll_manager->modfd(m_sockfd, EPOLLIN, m_TRIGMode);
-        }
         init();
         return true;
     }
@@ -758,10 +736,6 @@ bool http_conn::write()
                 {
                     if (errno == EAGAIN)
                     {
-                        if (m_epoll_manager)
-                        {
-                            m_epoll_manager->modfd(m_sockfd, EPOLLOUT, m_TRIGMode);
-                        }
                         return true;
                     }
                     unmap();
@@ -786,10 +760,6 @@ bool http_conn::write()
                         // sendfile 会自动更新 offset，需要同步
                         bytes_have_send = m_write_idx + offset;
                         bytes_to_send = m_file_stat.st_size - offset;
-                        if (m_epoll_manager)
-                        {
-                            m_epoll_manager->modfd(m_sockfd, EPOLLOUT, m_TRIGMode);
-                        }
                         return true;
                     }
                     unmap();
@@ -814,10 +784,6 @@ bool http_conn::write()
 
         // 发送完成
         unmap();
-        if (m_epoll_manager)
-        {
-            m_epoll_manager->modfd(m_sockfd, EPOLLIN, m_TRIGMode);
-        }
 
         if (m_linger)
         {
@@ -840,11 +806,6 @@ bool http_conn::write()
             {
                 if (errno == EAGAIN)
                 {
-                    // 使用 EpollManager 修改 fd 事件
-                    if (m_epoll_manager)
-                    {
-                        m_epoll_manager->modfd(m_sockfd, EPOLLOUT, m_TRIGMode);
-                    }
                     return true;
                 }
                 unmap();
@@ -868,11 +829,6 @@ bool http_conn::write()
             if (bytes_to_send <= 0)
             {
                 unmap();
-                // 使用 EpollManager 修改 fd 事件
-                if (m_epoll_manager)
-                {
-                    m_epoll_manager->modfd(m_sockfd, EPOLLIN, m_TRIGMode);
-                }
 
                 if (m_linger)
                 {
@@ -1127,22 +1083,12 @@ void http_conn::process()
     HTTP_CODE read_ret = process_read();
     if (read_ret == NO_REQUEST)
     {
-        // 使用 EpollManager 修改 fd 事件
-        if (m_epoll_manager)
-        {
-            m_epoll_manager->modfd(m_sockfd, EPOLLIN, m_TRIGMode);
-        }
         return;
     }
     bool write_ret = process_write(read_ret);
     if (!write_ret)
     {
         close_conn();
-    }
-    // 使用 EpollManager 修改 fd 事件
-    if (m_epoll_manager)
-    {
-        m_epoll_manager->modfd(m_sockfd, EPOLLOUT, m_TRIGMode);
     }
 }
 

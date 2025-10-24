@@ -1,5 +1,4 @@
 #include "lst_timer.h"
-#include "../epoll/epoll_manager.h"
 #include "../user/user_manager.h"
 
 sort_timer_lst::sort_timer_lst()
@@ -145,7 +144,7 @@ void sort_timer_lst::tick()
             break;
         }
         // 调用回调函数，传递依赖注入的对象
-        tmp->cb_func(tmp->user_data, tmp->epoll_manager, tmp->user_manager);
+        tmp->cb_func(tmp->user_data, tmp->user_manager);
         head = tmp->next;
         if (head)
         {
@@ -297,7 +296,7 @@ void heap_timer_lst::tick()
         // 调用回调函数
         if (timer->cb_func)
         {
-            timer->cb_func(timer->user_data, timer->epoll_manager, timer->user_manager);
+            timer->cb_func(timer->user_data, timer->user_manager);
         }
 
         // 移除堆顶 O(log n)
@@ -376,7 +375,7 @@ void heap_timer_lst::swap_timers(size_t i, size_t j)
 
 // ========================================
 
-Utils::Utils() : m_TIMESLOT(0), m_pipefd(NULL), m_epoll_manager(NULL)
+Utils::Utils() : m_TIMESLOT(0), m_pipefd(NULL)
 {
 }
 
@@ -387,11 +386,6 @@ Utils::~Utils()
 void Utils::init(int timeslot)
 {
     m_TIMESLOT = timeslot;
-}
-
-void Utils::set_epoll_manager(EpollManager *epoll_mgr)
-{
-    m_epoll_manager = epoll_mgr;
 }
 
 void Utils::set_signal_pipe(int *pipefd)
@@ -451,14 +445,14 @@ void Utils::show_error(int connfd, const char *info)
     close(connfd);
 }
 
-// 重构后的回调函数 - 使用依赖注入的对象
-void cb_func(client_data *user_data, EpollManager *epoll_mgr, UserManager *user_mgr)
+// 重构后的回调函数 - 移除EpollManager依赖
+void cb_func(client_data *user_data, UserManager *user_mgr)
 {
-    if (epoll_mgr)
-    {
-        epoll_mgr->removefd(user_data->sockfd);
-    }
     assert(user_data);
+
+    // 直接关闭socket（不再使用epoll）
+    close(user_data->sockfd);
+
     if (user_mgr)
     {
         user_mgr->decrement_user_count();

@@ -3,7 +3,6 @@
 #include <unistd.h>
 #include <signal.h>
 #include <sys/types.h>
-#include <sys/epoll.h>
 #include <fcntl.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -28,7 +27,6 @@
 #include "../log/log.h"
 
 // 前向声明
-class EpollManager;
 class UserManager;
 class StaticCache;
 
@@ -79,8 +77,7 @@ public:
     ~http_conn();
 
 public:
-    // 注入依赖：EpollManager 和 UserManager
-    void set_epoll_manager(EpollManager *epoll_mgr);
+    // 注入依赖：UserManager 和 StaticCache
     void set_user_manager(UserManager *user_mgr);
     void set_static_cache(StaticCache *cache);
 
@@ -213,7 +210,6 @@ private:
     char sql_name[100];
 
     // 依赖注入的成员
-    EpollManager *m_epoll_manager;
     UserManager *m_user_manager;
     StaticCache *m_static_cache;
 

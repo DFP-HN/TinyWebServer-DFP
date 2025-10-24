@@ -23,14 +23,9 @@
 WebServer::WebServer()
 {
     // 创建管理器实例（使用 make_unique 智能指针）
-    m_epoll_manager = std::make_unique<EpollManager>();
     m_user_manager = std::make_unique<UserManager>();
     m_static_cache = std::make_unique<StaticCache>(256);  // 256MB缓存
-
-#ifdef USE_IO_URING
-    // 创建 io_uring 管理器（队列深度 256）
     m_io_uring_manager = std::make_unique<IoUringManager>(256);
-#endif
 
     // 创建 http_conn 对象数组（使用智能指针）
     users = std::make_unique<http_conn[]>(MAX_FD);
@@ -38,7 +33,6 @@ WebServer::WebServer()
     // 为所有 http_conn 对象注入依赖
     for (int i = 0; i < MAX_FD; ++i)
     {
-        users[i].set_epoll_manager(m_epoll_manager.get());
         users[i].set_user_manager(m_user_manager.get());
         users[i].set_static_cache(m_static_cache.get());
     }
@@ -82,57 +76,46 @@ void WebServer::init(int port, string user, string passWord, string databaseName
     m_actormodel = actor_model;
     m_event_loop_mode = event_loop_mode;
 
-#ifdef USE_IO_URING
-    // 如果使用 io_uring 模式（回调或协程），初始化 io_uring 管理器
-    if ((m_event_loop_mode == IO_URING_MODE || m_event_loop_mode == COROUTINE_MODE) && m_io_uring_manager)
+    // 初始化 io_uring 管理器（所有模式都需要）
+    if (m_io_uring_manager)
     {
         if (!m_io_uring_manager->init())
         {
-            LOG_ERROR("Failed to initialize io_uring, falling back to epoll mode");
-            m_event_loop_mode = EPOLL_MODE;
+            LOG_ERROR("Failed to initialize io_uring");
+            exit(1);
         }
-        else
+
+        if (m_event_loop_mode == IO_URING_MODE)
         {
-            if (m_event_loop_mode == IO_URING_MODE)
-            {
-                LOG_INFO("io_uring initialized successfully (callback style)");
-            }
-            else if (m_event_loop_mode == COROUTINE_MODE)
-            {
+            LOG_INFO("io_uring initialized successfully (callback style)");
+        }
+        else if (m_event_loop_mode == COROUTINE_MODE)
+        {
 #ifdef USE_COROUTINE
-                LOG_INFO("io_uring initialized successfully (coroutine style)");
+            LOG_INFO("io_uring initialized successfully (coroutine style)");
 
-                // 创建CPU线程池（线程数=CPU核心数的一半，避免过度竞争）
-                size_t cpu_threads = std::thread::hardware_concurrency() / 2;
-                if (cpu_threads < 2) cpu_threads = 2;
-                if (cpu_threads > 8) cpu_threads = 8;  // 最多8个线程
+            // 创建CPU线程池（线程数=CPU核心数的一半，避免过度竞争）
+            size_t cpu_threads = std::thread::hardware_concurrency() / 2;
+            if (cpu_threads < 2) cpu_threads = 2;
+            if (cpu_threads > 8) cpu_threads = 8;  // 最多8个线程
 
-                m_cpu_thread_pool = std::make_unique<CpuThreadPool>(cpu_threads, 1000);
-                LOG_INFO("CPU thread pool created: %zu threads", cpu_threads);
+            m_cpu_thread_pool = std::make_unique<CpuThreadPool>(cpu_threads, 1000);
+            LOG_INFO("CPU thread pool created: %zu threads", cpu_threads);
 
-                // 创建任务分发器
-                m_task_dispatcher = std::make_unique<TaskDispatcher>();
-                LOG_INFO("Task dispatcher created");
+            // 创建任务分发器
+            m_task_dispatcher = std::make_unique<TaskDispatcher>();
+            LOG_INFO("Task dispatcher created");
 
-                // 创建增强型协程调度器（最多10000个并发协程）
-                m_coro_scheduler = std::make_unique<AdvancedScheduler>(
-                    m_io_uring_manager.get(), 10000);
-                LOG_INFO("Advanced coroutine scheduler created");
+            // 创建增强型协程调度器（最多10000个并发协程）
+            m_coro_scheduler = std::make_unique<AdvancedScheduler>(
+                m_io_uring_manager.get(), 10000);
+            LOG_INFO("Advanced coroutine scheduler created");
 #else
-                LOG_WARN("Coroutine not compiled, falling back to io_uring callback mode");
-                m_event_loop_mode = IO_URING_MODE;
+            LOG_ERROR("Coroutine not compiled, please build with USE_COROUTINE=1");
+            exit(1);
 #endif
-            }
         }
     }
-#else
-    // 如果没有编译 io_uring 支持，强制使用 epoll 模式
-    if (m_event_loop_mode == IO_URING_MODE || m_event_loop_mode == COROUTINE_MODE)
-    {
-        LOG_WARN("io_uring not compiled, falling back to epoll mode");
-        m_event_loop_mode = EPOLL_MODE;
-    }
-#endif
 }
 
 void WebServer::trig_mode()
@@ -198,13 +181,6 @@ void WebServer::sql_pool()
     users[0].initmysql_result(m_connPool);
 }
 
-void WebServer::thread_pool()
-{
-    //线程池（使用智能指针）
-    m_pool = std::make_unique<threadpool<http_conn>>(m_actormodel, m_connPool, m_thread_num);
-    // m_pool = std::make_unique<WorkStealingPool<http_conn>>(m_actormodel, m_connPool, m_thread_num);
-}
-
 void WebServer::eventListen()
 {
     //网络编程基础步骤
@@ -237,34 +213,8 @@ void WebServer::eventListen()
     ret = listen(m_listenfd, 5);
     assert(ret >= 0);
 
-    // 初始化 Utils
+    // 初始化 Utils（用于定时器）
     utils.init(TIMESLOT);
-
-    // 创建 epoll 实例
-    m_epoll_manager->create(5);
-
-    // 注册监听 socket
-    m_epoll_manager->addfd(m_listenfd, false, m_LISTENTrigmode);
-
-    // 创建信号管道
-    ret = socketpair(PF_UNIX, SOCK_STREAM, 0, m_pipefd);
-    assert(ret != -1);
-    EpollManager::setnonblocking(m_pipefd[1]);
-    m_epoll_manager->addfd(m_pipefd[0], false, 0);
-
-    // 设置 Utils 的依赖（智能指针用 .get() 获取原始指针）
-    utils.set_epoll_manager(m_epoll_manager.get());
-    utils.set_signal_pipe(m_pipefd);
-
-    // 设置全局 Utils 实例（用于信号处理）
-    set_global_utils_instance(&utils);
-
-    // 注册信号
-    utils.addsig(SIGPIPE, SIG_IGN);
-    utils.addsig(SIGALRM, global_sig_handler, false);
-    utils.addsig(SIGTERM, global_sig_handler, false);
-
-    alarm(TIMESLOT);
 }
 
 void WebServer::timer(int connfd, struct sockaddr_in client_address)
@@ -281,8 +231,7 @@ void WebServer::timer(int connfd, struct sockaddr_in client_address)
     timer->user_data = &users_timer[connfd];
     timer->cb_func = cb_func;
 
-    // 设置定时器的依赖注入（智能指针用 .get() 获取原始指针）
-    timer->epoll_manager = m_epoll_manager.get();
+    // 设置定时器的依赖注入（移除epoll_manager）
     timer->user_manager = m_user_manager.get();
 
     time_t cur = time(NULL);
@@ -304,7 +253,7 @@ void WebServer::adjust_timer(std::shared_ptr<util_timer> timer)
 
 void WebServer::deal_timer(std::shared_ptr<util_timer> timer, int sockfd)
 {
-    timer->cb_func(&users_timer[sockfd], m_epoll_manager.get(), m_user_manager.get());
+    timer->cb_func(&users_timer[sockfd], m_user_manager.get());
     if (timer)
     {
         utils.m_timer_lst.del_timer(timer);
@@ -313,241 +262,6 @@ void WebServer::deal_timer(std::shared_ptr<util_timer> timer, int sockfd)
     LOG_INFO("close fd %d", users_timer[sockfd].sockfd);
 }
 
-bool WebServer::dealclientdata()
-{
-    struct sockaddr_in client_address;
-    socklen_t client_addrlength = sizeof(client_address);
-    if (0 == m_LISTENTrigmode)
-    {
-        int connfd = accept(m_listenfd, (struct sockaddr *)&client_address, &client_addrlength);
-        if (connfd < 0)
-        {
-            LOG_ERROR("%s:errno is:%d", "accept error", errno);
-            return false;
-        }
-        if (m_user_manager->get_user_count() >= MAX_FD)
-        {
-            utils.show_error(connfd, "Internal server busy");
-            LOG_ERROR("%s", "Internal server busy");
-            return false;
-        }
-        timer(connfd, client_address);
-    }
-
-    else
-    {
-        while (1)
-        {
-            int connfd = accept(m_listenfd, (struct sockaddr *)&client_address, &client_addrlength);
-            if (connfd < 0)
-            {
-                LOG_ERROR("%s:errno is:%d", "accept error", errno);
-                break;
-            }
-            if (m_user_manager->get_user_count() >= MAX_FD)
-            {
-                utils.show_error(connfd, "Internal server busy");
-                LOG_ERROR("%s", "Internal server busy");
-                break;
-            }
-            timer(connfd, client_address);
-        }
-        return false;
-    }
-    return true;
-}
-
-bool WebServer::dealwithsignal(bool &timeout, bool &stop_server)
-{
-    int ret = 0;
-    int sig;
-    char signals[1024];
-    ret = recv(m_pipefd[0], signals, sizeof(signals), 0);
-    if (ret == -1)
-    {
-        return false;
-    }
-    else if (ret == 0)
-    {
-        return false;
-    }
-    else
-    {
-        for (int i = 0; i < ret; ++i)
-        {
-            switch (signals[i])
-            {
-            case SIGALRM:
-            {
-                timeout = true;
-                break;
-            }
-            case SIGTERM:
-            {
-                stop_server = true;
-                break;
-            }
-            }
-        }
-    }
-    return true;
-}
-
-void WebServer::dealwithread(int sockfd)
-{
-    auto timer = users_timer[sockfd].timer;  // shared_ptr
-
-    //reactor
-    if (1 == m_actormodel)
-    {
-        if (timer)
-        {
-            adjust_timer(timer);
-        }
-
-        //若监测到读事件，将该事件放入请求队列
-        m_pool->append(&users[sockfd], 0);
-
-        while (true)
-        {
-            if (1 == users[sockfd].improv)
-            {
-                if (1 == users[sockfd].timer_flag)
-                {
-                    deal_timer(timer, sockfd);
-                    users[sockfd].timer_flag = 0;
-                }
-                users[sockfd].improv = 0;
-                break;
-            }
-        }
-    }
-    else
-    {
-        //proactor
-        if (users[sockfd].read_once())
-        {
-            LOG_INFO("deal with the client(%s)", inet_ntoa(users[sockfd].get_address()->sin_addr));
-
-            //若监测到读事件，将该事件放入请求队列
-            m_pool->append_p(&users[sockfd]);
-
-            if (timer)
-            {
-                adjust_timer(timer);
-            }
-        }
-        else
-        {
-            deal_timer(timer, sockfd);
-        }
-    }
-}
-
-void WebServer::dealwithwrite(int sockfd)
-{
-    auto timer = users_timer[sockfd].timer;  // shared_ptr
-    //reactor
-    if (1 == m_actormodel)
-    {
-        if (timer)
-        {
-            adjust_timer(timer);
-        }
-
-        m_pool->append(&users[sockfd], 1);
-
-        while (true)
-        {
-            if (1 == users[sockfd].improv)
-            {
-                if (1 == users[sockfd].timer_flag)
-                {
-                    deal_timer(timer, sockfd);
-                    users[sockfd].timer_flag = 0;
-                }
-                users[sockfd].improv = 0;
-                break;
-            }
-        }
-    }
-    else
-    {
-        //proactor
-        if (users[sockfd].write())
-        {
-            LOG_INFO("send data to the client(%s)", inet_ntoa(users[sockfd].get_address()->sin_addr));
-
-            if (timer)
-            {
-                adjust_timer(timer);
-            }
-        }
-        else
-        {
-            deal_timer(timer, sockfd);
-        }
-    }
-}
-
-void WebServer::eventLoop()
-{
-    bool timeout = false;
-    bool stop_server = false;
-
-    while (!stop_server)
-    {
-        int number = m_epoll_manager->wait(events, MAX_EVENT_NUMBER, -1);
-        if (number < 0 && errno != EINTR)
-        {
-            LOG_ERROR("%s", "epoll failure");
-            break;
-        }
-
-        for (int i = 0; i < number; i++)
-        {
-            int sockfd = events[i].data.fd;
-
-            //处理新到的客户连接
-            if (sockfd == m_listenfd)
-            {
-                bool flag = dealclientdata();
-                if (false == flag)
-                    continue;
-            }
-            else if (events[i].events & (EPOLLRDHUP | EPOLLHUP | EPOLLERR))
-            {
-                //服务器端关闭连接，移除对应的定时器
-                auto timer = users_timer[sockfd].timer;  // shared_ptr
-                deal_timer(timer, sockfd);
-            }
-            //处理信号
-            else if ((sockfd == m_pipefd[0]) && (events[i].events & EPOLLIN))
-            {
-                bool flag = dealwithsignal(timeout, stop_server);
-                if (false == flag)
-                    LOG_ERROR("%s", "dealclientdata failure");
-            }
-            //处理客户连接上接收到的数据
-            else if (events[i].events & EPOLLIN)
-            {
-                dealwithread(sockfd);
-            }
-            else if (events[i].events & EPOLLOUT)
-            {
-                dealwithwrite(sockfd);
-            }
-        }
-        if (timeout)
-        {
-            utils.timer_handler();
-
-            LOG_INFO("%s", "timer tick");
-
-            timeout = false;
-        }
-    }
-}
 
 // ==================== 协程实现 ====================
 

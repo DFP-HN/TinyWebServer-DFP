@@ -24,7 +24,7 @@ CXXFLAGS = -std=c++17 -Wall -Wextra
 ifeq ($(DEBUG), 1)
     CXXFLAGS += -g -O0
 else
-    CXXFLAGS += -O2 -DNDEBUG
+    CXXFLAGS += -O3 -DNDEBUG
 endif
 
 # 链接库
